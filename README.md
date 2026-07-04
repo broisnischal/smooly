@@ -2,7 +2,7 @@
 
 **Make any mouse feel premium on Windows.** smooly adds buttery momentum
 scrolling, pointer tuning, macOS-style shake-to-find, cursor themes, and
-Mac-Mouse-Fix-style button remapping — in one tiny (~1 MB), native app that
+button remapping — in one tiny (~1 MB), native app that
 lives in your tray.
 
 <!-- Add a screenshot: docs/screenshot.png -->
