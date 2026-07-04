@@ -1,0 +1,19 @@
+Bundled cursor themes
+=====================
+
+The "macOS Light", "macOS Dark", and "Linux (Sharp)" cursor themes are the
+Bibata cursor set by Kaiz Khatri (ful1e5) and contributors.
+
+  Project : https://github.com/ful1e5/Bibata_Cursor
+  Version : v2.0.7 (Regular size), Windows .cur/.ani build
+  License : GPL-3.0 and SIL Open Font License 1.1
+
+  macOS Light   = Bibata Modern Ice      (white, rounded)
+  macOS Dark    = Bibata Modern Classic  (black, rounded)
+  Linux (Sharp) = Bibata Original Ice    (white, sharp corners)
+
+Bibata is redistributed here unmodified under the terms of its license.
+To add your own theme, drop a folder of .cur/.ani files (ideally with the
+pack's install.inf) into this directory, or into:
+    %APPDATA%\smooly\cursors\<Your Theme Name>\
+and it will appear in smooly's Cursor theme list.

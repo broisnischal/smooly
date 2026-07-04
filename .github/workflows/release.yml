@@ -1,0 +1,80 @@
+name: Release
+
+# Tag a commit (e.g. `git tag v1.0.0 && git push --tags`) to build, sign and publish.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write        # create the GitHub Release
+  id-token: write        # SignPath OIDC trust
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_NAME -match '^v') { $env:GITHUB_REF_NAME -replace '^v','' } else { '0.0.0-dev' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Set up MinGW (g++)
+        uses: egor-tensin/setup-mingw@v2.2.0
+        with:
+          platform: x64
+
+      - name: Build smooly.exe
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File build.ps1
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.ver.outputs.version }} installer\smooly.iss
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force dist,stage | Out-Null
+          Copy-Item smooly.exe,README.md,LICENSE stage
+          Copy-Item cursors,fonts stage -Recurse
+          Compress-Archive -Path "stage\*" -DestinationPath "dist\smooly-$v-portable.zip" -Force
+
+      - name: Upload unsigned artifacts (input for signing)
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smooly-unsigned
+          path: dist
+
+      # --- Code signing via SignPath Foundation (free, OSS) ---
+      # One-time setup: see docs/SIGNING.md. Requires the SIGNPATH_API_TOKEN secret
+      # and SIGNPATH_ORGANIZATION_ID variable, plus a project + signing policy on SignPath.
+      - name: Sign with SignPath
+        id: sign
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: smooly
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: initial
+          github-artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist-signed
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-signed/smooly-${{ steps.ver.outputs.version }}-setup.exe
+            dist-signed/smooly-${{ steps.ver.outputs.version }}-portable.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

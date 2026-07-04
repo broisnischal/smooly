@@ -1,0 +1,32 @@
+# Normalize text files to LF in the repo; check out native on each platform.
+* text=auto
+
+# Source / text (LF in repo)
+*.cpp   text
+*.h     text
+*.md    text
+*.yml   text
+*.yaml  text
+*.json  text
+*.iss   text
+*.rc    text
+*.manifest text
+*.txt   text
+.gitignore   text
+.gitattributes text
+
+# Windows scripts want CRLF so they run cleanly with Windows tooling
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+
+# Binary assets — NEVER apply line-ending conversion (would corrupt them)
+*.ttf   binary
+*.otf   binary
+*.cur   binary
+*.ani   binary
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.exe   binary
+*.zip   binary
+*.inf   binary

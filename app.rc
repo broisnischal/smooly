@@ -1,0 +1,5 @@
+#include <winuser.h>
+
+// Embed the application manifest (RT_MANIFEST = 24, id 1 = the .exe itself)
+// so common controls v6 themed widgets and DPI awareness take effect.
+1 24 "app.manifest"

@@ -1,0 +1,15 @@
+# build output
+smooly.exe
+app_res.o
+*.o
+*.obj
+
+# packaging output
+/dist/
+/stage/
+/dist-signed/
+
+# editor / os
+.vs/
+*.user
+Thumbs.db

@@ -1,0 +1,20 @@
+PackageIdentifier: NischalDahal.smooly
+PackageVersion: 1.0.0
+InstallerType: inno
+Scope: machine
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+InstallerSwitches:
+  Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+  SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART
+AppsAndFeaturesEntries:
+  - ProductCode: '{B2E9A6C4-3F1D-4A8E-9C7B-2D5E1F0A6B33}_is1'
+    UpgradeCode: '{B2E9A6C4-3F1D-4A8E-9C7B-2D5E1F0A6B33}'
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/nischal-dahal/smooly/releases/download/v1.0.0/smooly-1.0.0-setup.exe
+    InstallerSha256: REPLACE_WITH_SHA256_OF_SETUP_EXE
+ManifestType: installer
+ManifestVersion: 1.6.0

@@ -1,0 +1,24 @@
+{
+    "version": "1.0.0",
+    "description": "Smooth momentum scrolling, pointer tuning, cursor themes and button remapping for Windows.",
+    "homepage": "https://github.com/nischal-dahal/smooly",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/nischal-dahal/smooly/releases/download/v1.0.0/smooly-1.0.0-portable.zip",
+            "hash": "REPLACE_WITH_SHA256_OF_PORTABLE_ZIP"
+        }
+    },
+    "bin": "smooly.exe",
+    "shortcuts": [
+        ["smooly.exe", "smooly"]
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/nischal-dahal/smooly/releases/download/v$version/smooly-$version-portable.zip"
+            }
+        }
+    }
+}

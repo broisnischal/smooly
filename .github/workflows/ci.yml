@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up MinGW (g++)
+        uses: egor-tensin/setup-mingw@v2.2.0
+        with:
+          platform: x64
+      - name: Build
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File build.ps1
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: smooly-dev
+          path: |
+            smooly.exe
+            cursors
+            fonts

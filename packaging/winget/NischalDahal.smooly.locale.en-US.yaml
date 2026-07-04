@@ -1,0 +1,25 @@
+PackageIdentifier: NischalDahal.smooly
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: Nischal Dahal
+PublisherUrl: https://github.com/nischal-dahal
+PackageName: smooly
+PackageUrl: https://github.com/nischal-dahal/smooly
+License: MIT
+LicenseUrl: https://github.com/nischal-dahal/smooly/blob/main/LICENSE
+ShortDescription: Smooth momentum scrolling, pointer tuning, cursor themes and button remapping for Windows.
+Description: >-
+  smooly makes any ordinary mouse feel like a premium one: momentum smooth
+  scrolling with per-app exclusions, OS pointer speed/acceleration control,
+  shake-to-locate, bundled cursor themes and sizes, and Mac-Mouse-Fix-style
+  button remapping (Click / Double-Click / Hold / Click+Scroll / Click+Drag,
+  including keyboard shortcuts and type-text macros).
+Moniker: smooly
+Tags:
+  - mouse
+  - scrolling
+  - smooth-scroll
+  - cursor
+  - productivity
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
