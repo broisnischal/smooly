@@ -61,9 +61,20 @@ jobs:
 
       # --- Code signing via SignPath Foundation (free, OSS) ---
       # One-time setup: see docs/SIGNING.md. Requires the SIGNPATH_API_TOKEN secret
-      # and SIGNPATH_ORGANIZATION_ID variable, plus a project + signing policy on SignPath.
+      # and SIGNPATH_ORGANIZATION_ID variable. If they're absent, the release is
+      # published unsigned (SmartScreen may warn) — signing turns on automatically
+      # once the secrets exist, no workflow edit needed.
+      - name: Check signing availability
+        id: signing
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          $on = -not [string]::IsNullOrWhiteSpace($env:TOKEN)
+          "enabled=$($on.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
       - name: Sign with SignPath
-        id: sign
+        if: steps.signing.outputs.enabled == 'true'
         uses: signpath/github-action-submit-signing-request@v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -75,11 +86,18 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: dist-signed
 
+      - name: Select release directory
+        id: rel
+        shell: pwsh
+        run: |
+          $dir = if ("${{ steps.signing.outputs.enabled }}" -eq 'true') { 'dist-signed' } else { 'dist' }
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist-signed/smooly-${{ steps.ver.outputs.version }}-setup.exe
-            dist-signed/smooly-${{ steps.ver.outputs.version }}-portable.zip
+            ${{ steps.rel.outputs.dir }}/smooly-${{ steps.ver.outputs.version }}-setup.exe
+            ${{ steps.rel.outputs.dir }}/smooly-${{ steps.ver.outputs.version }}-portable.zip
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -7,7 +7,7 @@
 #define AppName "smooly"
 #define AppPublisher "Nischal Dahal"
 #define AppExe "smooly.exe"
-#define AppUrl "https://github.com/nischal-dahal/smooly"
+#define AppUrl "https://github.com/broisnischal/smooly"
 
 [Setup]
 AppId={{B2E9A6C4-3F1D-4A8E-9C7B-2D5E1F0A6B33}
