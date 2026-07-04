@@ -778,7 +778,10 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
         }
 
-        { HWND wu = WindowFromPoint(ms->pt); if (wu && GetAncestor(wu, GA_ROOT) == g_wnd) break; }   // don't smooth our own UI
+        // Only when our settings window is on-screen: don't smooth our own UI. Skipping
+        // WindowFromPoint (a slow cross-process query) on the hook hot path when it's
+        // hidden keeps scrolling latency-free.
+        if (g_wnd && IsWindowVisible(g_wnd)) { HWND wu = WindowFromPoint(ms->pt); if (wu && GetAncestor(wu, GA_ROOT) == g_wnd) break; }
 
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_cfg.enabled || g_cfg.smoothness == 0) break;
@@ -1008,7 +1011,10 @@ static void AnimationLoop() {
         if (emitV != 0.0) { g_accV += emitV; int w = (int)g_accV; g_accV -= w; if (w) EmitWheel(false, w); }
         if (emitH != 0.0) { g_accH += emitH; int w = (int)g_accH; g_accH -= w; if (w) EmitWheel(true,  w); }
 
-        std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(frameMs));
+        // Sleep the *remainder* of the frame so events go out evenly spaced. Sleeping a
+        // fixed frameMs after variable work makes the period drift -> jittery scrolling.
+        double sleepMs = frameMs - ticksToMs(nowTicks() - cur);
+        if (sleepMs > 0.3) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(sleepMs));
     }
     if (g_cursorBig) { FreeShakeBase(); RestoreCursors(); g_cursorBig = false; }
     timeEndPeriod(1);

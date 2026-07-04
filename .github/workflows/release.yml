@@ -23,10 +23,15 @@ jobs:
           $v = if ($env:GITHUB_REF_NAME -match '^v') { $env:GITHUB_REF_NAME -replace '^v','' } else { '0.0.0-dev' }
           "version=$v" >> $env:GITHUB_OUTPUT
 
-      - name: Set up MinGW (g++)
-        uses: egor-tensin/setup-mingw@v2.2.0
+      - name: Set up MinGW (MSYS2)
+        uses: msys2/setup-msys2@v2
         with:
-          platform: x64
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        shell: msys2 {0}
+        run: echo "$(cygpath -w /mingw64/bin)" >> "$GITHUB_PATH"
 
       - name: Build smooly.exe
         shell: pwsh

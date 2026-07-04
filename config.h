@@ -72,9 +72,10 @@ static const double kShakeShrinkRate   = 15.0;  // ease-out speed back to normal
 static const double kRateBySmoothness[6] = { 0.0, 25.0, 18.0, 13.0, 9.5, 7.0 };
 
 // The owed distance always clears at >= this speed (units/sec). This caps the
-// tail so a scroll never creeps for a second before stopping — short scrolls stay
-// responsive even on Buttery, while the eased start keeps everything smooth.
-static const double kMinScrollSpeed = 320.0;
+// tail so a scroll never creeps before stopping. It mainly affects SHORT scrolls
+// (a notch or two) — keeping them crisp instead of floaty — while long flings are
+// dominated by the eased head and stay smooth.
+static const double kMinScrollSpeed = 620.0;
 
 // Base scroll distance per physical notch (a native notch is 120 units).
 static const double kStepBySpeed[3] = { 90.0, 150.0, 240.0 };
