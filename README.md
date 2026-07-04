@@ -19,8 +19,7 @@ lives in your tray.
   *sustained* fast scrolling, so a quick flick doesn't overshoot.
 - **Reverse (natural) direction**, **smooth horizontal (tilt) wheel**, and
   **Shift + wheel → horizontal**.
-- **Skips apps that shouldn't be smoothed** — terminals, Premiere, After Effects,
-  Photoshop, Blender, DAWs, Unity/Unreal… scroll natively (editable list).
+- **Works in every app** — the smoothing is applied globally.
 
 ### 🎯 Pointer
 - Set the **OS pointer speed** and **disable "enhance pointer precision"** for

@@ -73,7 +73,6 @@ static std::mutex        g_mutex;              // guards g_cfg + physics state
 static std::atomic<bool> g_running{true};
 static HHOOK             g_hook   = nullptr;
 static Config           g_cfg;
-static std::vector<std::wstring> g_excludeTokens;   // parsed from g_cfg.exclude (built at load)
 
 // physics state (guarded by g_mutex)
 static double   g_remV = 0.0, g_remH = 0.0;    // scroll distance still owed per axis
@@ -147,9 +146,9 @@ static HBRUSH g_brSide = nullptr, g_brBg = nullptr;
 
 // declarative rows -> lets WM_PAINT draw cards + labels from stored geometry.
 // top/h = row rect; cx/cy/ch = the control's own rect (for scroll repositioning).
-struct UiRow { int page, card, kind, top, h, cx, cy, ch; HWND ctrl; std::wstring label; };  // kind: 0 toggle,1 dropdown,2 slider,4 capture,5 remove
+struct UiRow { int page, card, kind, top, h, cx, cy, ch; HWND ctrl; std::wstring label; };  // kind: 0 toggle,1 dropdown,2 slider,4 capture,5 remove,6 selector pill
 static std::vector<UiRow> g_rows;
-static int g_scrollY = 0;   // content scroll offset for the current page
+static int g_selBtn = 0;   // Buttons page: which registered button is shown
 
 // HugeIcons (stroke, 24x24 viewBox) rendered via the mini SVG path renderer below.
 static const char* IC_SCROLL[] = {
@@ -191,9 +190,9 @@ static const int kNumPages = 5;
 #define ID_GESTURE 1013
 #define ID_PSPEED  1015
 #define ID_NOACCEL 1016
-#define ID_EXCLUDE 1021
 #define ID_CAPTURE 1022
 #define ID_DYN_BASE 3000   // dynamic button dropdowns: 3000 + mapIndex*8 + trigger(0..3)
+#define ID_SEL_BASE 3700   // 3700 + mapIndex = Buttons-page selector pill
 #define ID_DYN_REMOVE 3900 // 3900 + mapIndex = "remove this button"
 #define ID_STARTUP 1007
 #define ID_SUB     1100
@@ -225,19 +224,6 @@ static void LoadConfig() {
     g_cfg.accel      = GetPrivateProfileIntW(L"scroll", L"accel",      2, p.c_str());
     g_cfg.reverse    = GetPrivateProfileIntW(L"scroll", L"reverse",    0, p.c_str());
     g_cfg.horizontal = GetPrivateProfileIntW(L"scroll", L"horizontal", 1, p.c_str());
-    g_cfg.excludeApps = GetPrivateProfileIntW(L"scroll", L"excludeApps", 1, p.c_str());
-    {
-        wchar_t eb[1024];
-        GetPrivateProfileStringW(L"scroll", L"exclude", kDefaultExclude, eb, 1024, p.c_str());
-        g_cfg.exclude = eb;
-        g_excludeTokens.clear();
-        std::wstring cur;
-        for (wchar_t c : g_cfg.exclude) {
-            if (c == L';') { if (!cur.empty()) g_excludeTokens.push_back(cur); cur.clear(); }
-            else { if (c >= L'A' && c <= L'Z') c += 32; cur += c; }
-        }
-        if (!cur.empty()) g_excludeTokens.push_back(cur);
-    }
     g_cfg.shiftHoriz = GetPrivateProfileIntW(L"scroll", L"shiftHoriz", 1, p.c_str());
     g_cfg.ctrlTurbo  = GetPrivateProfileIntW(L"scroll", L"ctrlTurbo",  0, p.c_str());
     g_cfg.gestures   = GetPrivateProfileIntW(L"scroll", L"gestures",   0, p.c_str());
@@ -280,8 +266,6 @@ static void SaveConfig() {
     W(L"enabled", g_cfg.enabled);   W(L"smoothness", g_cfg.smoothness);
     W(L"speed",   g_cfg.speed);     W(L"accel",      g_cfg.accel);
     W(L"reverse", g_cfg.reverse);   W(L"horizontal", g_cfg.horizontal);
-    W(L"excludeApps", g_cfg.excludeApps);
-    WritePrivateProfileStringW(L"scroll", L"exclude", g_cfg.exclude.c_str(), p.c_str());
     W(L"shiftHoriz", g_cfg.shiftHoriz); W(L"ctrlTurbo", g_cfg.ctrlTurbo);
     W(L"gestures", g_cfg.gestures);
     W(L"shake",   g_cfg.shake);
@@ -331,7 +315,9 @@ static void SetStartup(bool on) {
 
 static void ApplyPointerSpeed(int speed) {   // 1..20, the OS pointer sensitivity
     if (speed < 1) speed = 1; else if (speed > 20) speed = 20;
-    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)speed, SPIF_SENDCHANGE);
+    // No SPIF_SENDCHANGE: the speed applies live immediately; broadcasting
+    // WM_SETTINGCHANGE to every window on each drag tick is what made it lag.
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)speed, 0);
 }
 static void ApplyNoAccel(bool on) {          // toggle "enhance pointer precision"
     int m[3] = { on ? 0 : g_origMouse[0], on ? 0 : g_origMouse[1], on ? 0 : g_origMouse[2] };
@@ -391,9 +377,10 @@ static HCURSOR CursorFromARGB(const BYTE* argb, int w, int h, int hotX, int hotY
 }
 
 // Build a crisp scaled copy of a cursor from an explicit source handle (NOT the
-// live system cursor — scaling the live one each frame would compound). Scales the
-// cursor's straight-ARGB pixels with GDI+ high-quality bicubic; falls back to
-// DrawIconEx for cursors without an alpha channel (old mono cursors).
+// live system cursor — scaling the live one each frame would compound). Recovers
+// true straight alpha by rendering the cursor over black and over white and taking
+// the per-pixel difference, so BOTH alpha and mask cursors (incl. the default Windows
+// arrow) come out with correct transparency — no black box — then bicubic-scales.
 static HCURSOR MakeScaledCursor(HCURSOR src, double scale) {
     if (!src) return nullptr;
     ICONINFO ii = {};
@@ -403,68 +390,62 @@ static HCURSOR MakeScaledCursor(HCURSOR src, double scale) {
     int baseW = 32, baseH = 32;
     if (ii.hbmColor && GetObject(ii.hbmColor, sizeof(bm), &bm)) { baseW = bm.bmWidth; baseH = bm.bmHeight; }
     else if (ii.hbmMask && GetObject(ii.hbmMask, sizeof(bm), &bm)) { baseW = bm.bmWidth; baseH = bm.bmHeight / 2; }
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask)  DeleteObject(ii.hbmMask);
     int w = (int)(baseW * scale + 0.5), h = (int)(baseH * scale + 0.5);
     if (w < 1) w = 1; if (h < 1) h = 1;
-    int hotX = (int)(ii.xHotspot * scale), hotY = (int)(ii.yHotspot * scale);
+    int hotX = (int)(ii.xHotspot * scale + 0.5), hotY = (int)(ii.yHotspot * scale + 0.5);
 
-    HCURSOR out = nullptr;
-    if (ii.hbmColor) {
-        std::vector<BYTE> srcBits((size_t)baseW * baseH * 4);
+    auto renderOn = [&](COLORREF bg, std::vector<BYTE>& out) {
+        HDC screen = GetDC(nullptr); HDC mem = CreateCompatibleDC(screen);
         BITMAPINFO bi = {};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = baseW; bi.bmiHeader.biHeight = -baseH;
         bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-        HDC dc = GetDC(nullptr);
-        GetDIBits(dc, ii.hbmColor, 0, baseH, srcBits.data(), &bi, DIB_RGB_COLORS);
-        ReleaseDC(nullptr, dc);
-
-        bool hasAlpha = false;
-        for (size_t i = 3; i < srcBits.size(); i += 4) if (srcBits[i]) { hasAlpha = true; break; }
-        if (hasAlpha) {
-            Gdiplus::Bitmap srcBmp(baseW, baseH, baseW * 4, PixelFormat32bppARGB, srcBits.data());
-            Gdiplus::Bitmap dst(w, h, PixelFormat32bppARGB);
-            {
-                Gdiplus::Graphics g(&dst);
-                g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-                g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-                g.DrawImage(&srcBmp, 0, 0, w, h);
-            }
-            Gdiplus::Rect rc(0, 0, w, h);
-            Gdiplus::BitmapData bd;
-            if (dst.LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
-                std::vector<BYTE> outBits((size_t)w * h * 4);
-                for (int y = 0; y < h; y++)
-                    memcpy(outBits.data() + (size_t)y * w * 4, (BYTE*)bd.Scan0 + (size_t)y * bd.Stride, (size_t)w * 4);
-                dst.UnlockBits(&bd);
-                out = CursorFromARGB(outBits.data(), w, h, hotX, hotY);
-            }
-        }
-    }
-
-    if (!out) {   // fallback: DrawIconEx into a DIB (mono / alpha-less cursors)
-        HDC screen = GetDC(nullptr);
-        HDC mem = CreateCompatibleDC(screen);
-        BITMAPINFO bi = {};
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
-        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
         void* bits = nullptr;
-        HBITMAP color = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        HBITMAP oldb = (HBITMAP)SelectObject(mem, color);
-        if (bits) memset(bits, 0, (size_t)w * h * 4);
-        SetStretchBltMode(mem, HALFTONE);
-        DrawIconEx(mem, 0, 0, src, w, h, 0, nullptr, DI_NORMAL);
-        SelectObject(mem, oldb);
-        std::vector<BYTE> zero((size_t)(((w + 15) / 16) * 2) * h, 0);
-        HBITMAP mask = CreateBitmap(w, h, 1, 1, zero.data());
-        ICONINFO ni = { FALSE, (DWORD)hotX, (DWORD)hotY, mask, color };
-        out = (HCURSOR)CreateIconIndirect(&ni);
-        DeleteObject(color); DeleteObject(mask);
-        DeleteDC(mem); ReleaseDC(nullptr, screen);
+        HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HBITMAP old = (HBITMAP)SelectObject(mem, dib);
+        RECT rc = { 0, 0, baseW, baseH }; HBRUSH br = CreateSolidBrush(bg);
+        FillRect(mem, &rc, br); DeleteObject(br);
+        DrawIconEx(mem, 0, 0, src, baseW, baseH, 0, nullptr, DI_NORMAL);
+        SelectObject(mem, old);
+        out.resize((size_t)baseW * baseH * 4);
+        if (bits) memcpy(out.data(), bits, out.size());
+        DeleteObject(dib); DeleteDC(mem); ReleaseDC(nullptr, screen);
+    };
+    std::vector<BYTE> onBlack, onWhite;
+    renderOn(RGB(0, 0, 0), onBlack);
+    renderOn(RGB(255, 255, 255), onWhite);
+
+    std::vector<BYTE> base((size_t)baseW * baseH * 4);   // straight BGRA
+    for (size_t i = 0; i < base.size(); i += 4) {
+        int d = (onWhite[i] - onBlack[i]) + (onWhite[i + 1] - onBlack[i + 1]) + (onWhite[i + 2] - onBlack[i + 2]);
+        int a = 255 - d / 3; if (a < 0) a = 0; else if (a > 255) a = 255;
+        for (int c = 0; c < 3; c++) {                    // un-premultiply the over-black color
+            int v = a > 0 ? onBlack[i + c] * 255 / a : 0;
+            base[i + c] = (BYTE)(v > 255 ? 255 : v);
+        }
+        base[i + 3] = (BYTE)a;
     }
 
-    if (ii.hbmColor) DeleteObject(ii.hbmColor);
-    if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+    HCURSOR out = nullptr;
+    Gdiplus::Bitmap srcBmp(baseW, baseH, baseW * 4, PixelFormat32bppARGB, base.data());
+    Gdiplus::Bitmap dst(w, h, PixelFormat32bppARGB);
+    {
+        Gdiplus::Graphics g(&dst);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        g.DrawImage(&srcBmp, 0, 0, w, h);
+    }
+    Gdiplus::Rect rc(0, 0, w, h);
+    Gdiplus::BitmapData bd;
+    if (dst.LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        std::vector<BYTE> outBits((size_t)w * h * 4);
+        for (int y = 0; y < h; y++)
+            memcpy(outBits.data() + (size_t)y * w * 4, (BYTE*)bd.Scan0 + (size_t)y * bd.Stride, (size_t)w * 4);
+        dst.UnlockBits(&bd);
+        out = CursorFromARGB(outBits.data(), w, h, hotX, hotY);
+    }
     return out;
 }
 
@@ -683,34 +664,6 @@ static bool ApplyCursorTheme(const std::wstring& name) {
     return ok;
 }
 
-// True if the app under the cursor should scroll natively (terminals, editors…).
-// Resolved only when the target window changes — cheap on the wheel hot path.
-static bool resolveExcluded(HWND w) {
-    if (!w) return false;
-    DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
-    if (!pid) return false;
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return false;
-    wchar_t path[MAX_PATH]; DWORD sz = MAX_PATH;
-    bool ok = QueryFullProcessImageNameW(h, 0, path, &sz);
-    CloseHandle(h);
-    if (!ok) return false;
-    std::wstring name = path;
-    size_t s = name.find_last_of(L"\\/");
-    if (s != std::wstring::npos) name = name.substr(s + 1);
-    for (auto& c : name) if (c >= L'A' && c <= L'Z') c += 32;
-    for (auto& tok : g_excludeTokens)
-        if (!tok.empty() && name.find(tok) != std::wstring::npos) return true;
-    return false;
-}
-static bool appExcluded(POINT pt) {
-    static HWND cached = nullptr; static bool excl = false;
-    HWND w = WindowFromPoint(pt);
-    if (w) w = GetAncestor(w, GA_ROOT);
-    if (w != cached) { cached = w; excl = resolveExcluded(w); }
-    return excl;
-}
-
 static BtnMap* findMap(int button) {         // g_maps is GUI-thread only (hook + UI)
     for (auto& m : g_maps) if (m.button == button) return &m;
     return nullptr;
@@ -825,8 +778,7 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
         }
 
-        if (!horizWheel) { HWND wu = WindowFromPoint(ms->pt); if (wu && GetAncestor(wu, GA_ROOT) == g_wnd) { PostMessageW(g_wnd, WM_APP + 3, (WPARAM)delta, 0); return 1; } }  // scroll our own UI
-        if (g_cfg.excludeApps && appExcluded(ms->pt)) break;   // let this app scroll natively
+        { HWND wu = WindowFromPoint(ms->pt); if (wu && GetAncestor(wu, GA_ROOT) == g_wnd) break; }   // don't smooth our own UI
 
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_cfg.enabled || g_cfg.smoothness == 0) break;
@@ -1112,7 +1064,6 @@ static int* toggleCfg(int id) {
     case ID_REVERSE: return &g_cfg.reverse;
     case ID_HORIZ:   return &g_cfg.horizontal;
     case ID_SHIFTH:  return &g_cfg.shiftHoriz;
-    case ID_EXCLUDE: return &g_cfg.excludeApps;
     case ID_CTRLT:   return &g_cfg.ctrlTurbo;
     case ID_GESTURE: return &g_cfg.gestures;
     case ID_NOACCEL: return &g_cfg.noAccel;
@@ -1274,39 +1225,16 @@ static std::wstring InputText(const wchar_t* title, const std::wstring& init) {
     return result;
 }
 
-static int contentTopY() { return P(56); }
-static int contentBotY(HWND h) { RECT cr; GetClientRect(h, &cr); return cr.bottom - P(34); }
-static int pageBottom() {   // bottom of the current page's content (absolute, pre-scroll)
-    int b = P(64);
-    for (auto& r : g_rows) if (r.page == g_page) { int rb = r.top + r.h; if (rb > b) b = rb; }
-    return b + P(12);
-}
-static int maxScroll(HWND h) { int n = pageBottom() - contentBotY(h); return n > 0 ? n : 0; }
-// A row is shown only when fully inside the viewport — no window regions (those left
-// unpainted white/ghost holes with WS_CLIPCHILDREN); a partial row just isn't drawn.
-static bool rowVisible(const UiRow& r, int vTop, int vBot) {
-    int ny = r.cy - g_scrollY;
-    return ny >= vTop && ny + r.ch <= vBot;
-}
-static void relayout(HWND h) {   // position/show controls for the current page + scroll offset
-    int vTop = contentTopY(), vBot = contentBotY(h);
-    int cnt = 0; for (auto& r : g_rows) if (r.page == g_page) cnt++;
-    HDWP dwp = BeginDeferWindowPos(cnt > 0 ? cnt : 1);   // move all controls atomically (no trails)
-    for (auto& r : g_rows) {
-        if (r.page != g_page) { ShowWindow(r.ctrl, SW_HIDE); continue; }
-        bool vis = rowVisible(r, vTop, vBot);
-        if (dwp) dwp = DeferWindowPos(dwp, r.ctrl, nullptr, r.cx, r.cy - g_scrollY, 0, 0,
-                                      SWP_NOSIZE | SWP_NOZORDER | (vis ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-    }
-    if (dwp) EndDeferWindowPos(dwp);
-    RECT content = { P(SB_W), vTop, P(WIN_W), vBot };
-    RedrawWindow(h, &content, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+// No scrolling anywhere: every page fits the fixed window (the Buttons page shows
+// one registered button at a time via a selector), so we only ever show/hide the
+// current page's controls — nothing moves, so there is nothing to flicker.
+static void relayout(HWND h) {
+    for (auto& r : g_rows) ShowWindow(r.ctrl, r.page == g_page ? SW_SHOW : SW_HIDE);
+    if (h) InvalidateRect(h, nullptr, TRUE);
 }
 static void ShowPage(int p) {
-    g_page = p; g_scrollY = 0;
-    if (g_wnd) relayout(g_wnd);
-    else for (auto& r : g_rows) ShowWindow(r.ctrl, r.page == p ? SW_SHOW : SW_HIDE);
-    if (g_wnd) InvalidateRect(g_wnd, nullptr, TRUE);
+    g_page = p;
+    relayout(g_wnd);
 }
 
 static Gdiplus::Color gpc(COLORREF c);
@@ -1374,13 +1302,24 @@ LRESULT CALLBACK CaptureProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static const wchar_t* cardHeader(int page, int card) {
-    if (page == 2) {
-        if (card < 0 || card >= (int)g_maps.size()) return nullptr;
-        int b = g_maps[card].button;
-        return b == 3 ? L"MIDDLE BUTTON" : b == 4 ? L"BUTTON 4  ·  BACK"
-             : b == 5 ? L"BUTTON 5  ·  FORWARD" : L"BUTTON";
-    }
-    return nullptr;
+    return nullptr;   // Buttons page identifies the selection via the pills; no card header needed
+}
+
+// Owner-draw BUTTONs erase to the default (light) background for one frame before
+// WM_DRAWITEM repaints -> the white flash on show/create. WM_DRAWITEM fills the whole
+// rect itself, so we subclass to swallow the erase entirely.
+static WNDPROC g_btnProc = nullptr;
+static LRESULT CALLBACK OwnerBtnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_ERASEBKGND) return 1;
+    return CallWindowProcW(g_btnProc, h, m, w, l);
+}
+static HWND makeOwnerBtn(HWND parent, int id, int x, int y, int w, int h) {
+    HWND c = CreateWindowW(L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW, x, y, w, h,
+                           parent, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    SetWindowTheme(c, L"", L"");
+    if (!g_btnProc) g_btnProc = (WNDPROC)GetWindowLongPtrW(c, GWLP_WNDPROC);
+    SetWindowLongPtrW(c, GWLP_WNDPROC, (LONG_PTR)OwnerBtnProc);
+    return c;
 }
 
 // Create one control for a row + record its UiRow. Geometry is derived from `kind`
@@ -1398,27 +1337,43 @@ static void addRow(HWND hwnd, int page, int card, int kind, int id, const wchar_
         c = CreateWindowW(L"SmoolySlider", L"", WS_CHILD, cx, cy, cw, ch, hwnd, (HMENU)(INT_PTR)id, hi, nullptr);
         SetWindowLongPtrW(c, GWLP_USERDATA, g_cfg.pointerSpeed > 0 ? g_cfg.pointerSpeed : g_sysSpeed);
     } else {
-        c = CreateWindowW(L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW, cx, cy, cw, ch, hwnd, (HMENU)(INT_PTR)id, hi, nullptr);
-        SetWindowTheme(c, L"", L"");   // no themed background -> no white flash on click
+        c = makeOwnerBtn(hwnd, id, cx, cy, cw, ch);
     }
     g_rows.push_back({ page, card, kind, rowTop, rowH, cx, cy, ch, c, label });
 }
 
+static std::wstring btnPillName(int b) {
+    return b == 3 ? L"Middle" : b == 4 ? L"Back" : b == 5 ? L"Forward" : L"Button";
+}
+// One button at a time: capture box, a selector pill per registered button, and the
+// selected button's card. Nothing overflows the fixed window -> no scrolling, no flicker.
 static void BuildButtonsPage(HWND hwnd) {
     HINSTANCE hi = GetModuleHandleW(nullptr);
-    const int left = P(SB_W + 28), right = P(WIN_W - 28), capH = P(64);
-    int y = P(64);
+    const int left = P(SB_W + 28), right = P(WIN_W - 28), capH = P(58);
+    int y = P(60);
     HWND cap = CreateWindowW(L"SmoolyCapture", L"", WS_CHILD, left, y, right - left, capH,
                              hwnd, (HMENU)(INT_PTR)ID_CAPTURE, hi, nullptr);
     g_rows.push_back({ 2, -1, 4, y, capH, left, y, capH, cap, L"" });
-    y += capH + P(14);
-    static const wchar_t* trg[5] = { L"Click", L"Double-Click", L"Hold", L"Click + Scroll", L"Click + Drag" };
-    for (int mi = 0; mi < (int)g_maps.size(); mi++) {
-        y += P(22) + P(8);
-        for (int tr = 0; tr < 5; tr++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 8 + tr, trg[tr], y); y += P(ROW_H); }
-        addRow(hwnd, 2, mi, 5, ID_DYN_REMOVE + mi, L"Remove this button", y);
-        y += P(ROW_H) + P(8);
+    y += capH + P(20);
+
+    int n = (int)g_maps.size();
+    if (n == 0) return;                                  // nothing registered yet
+    if (g_selBtn < 0) g_selBtn = 0;
+    if (g_selBtn >= n) g_selBtn = n - 1;
+
+    int px = left, ph = P(34);                           // selector pills (tabs)
+    for (int i = 0; i < n; i++) {
+        int pw = P(100);
+        HWND c = makeOwnerBtn(hwnd, ID_SEL_BASE + i, px, y, pw, ph);
+        g_rows.push_back({ 2, -2, 6, y, ph, px, y, ph, c, btnPillName(g_maps[i].button) });
+        px += pw + P(10);
     }
+    y += ph + P(22);
+
+    static const wchar_t* trg[5] = { L"Click", L"Double-Click", L"Hold", L"Click + Scroll", L"Click + Drag" };
+    int mi = g_selBtn;                                   // only the selected button's card
+    for (int tr = 0; tr < 5; tr++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 8 + tr, trg[tr], y); y += P(ROW_H); }
+    addRow(hwnd, 2, mi, 5, ID_DYN_REMOVE + mi, L"Remove this button", y);
 }
 static void RebuildButtons(HWND hwnd) {
     for (auto it = g_rows.begin(); it != g_rows.end();) {
@@ -1439,7 +1394,6 @@ static void BuildControls(HWND hwnd) {
         { 0, 1, 0, ID_REVERSE, L"Reverse scrolling" },
         { 0, 1, 0, ID_HORIZ,   L"Smooth horizontal (tilt) wheel" },
         { 0, 1, 0, ID_SHIFTH,  L"Shift + wheel scrolls horizontally" },
-        { 0, 1, 0, ID_EXCLUDE, L"Skip terminals & pro apps (native scroll)" },
         { 1, 0, 2, ID_PSPEED,  L"Pointer speed" },
         { 1, 0, 0, ID_NOACCEL, L"Disable pointer acceleration" },
         { 1, 1, 0, ID_SHAKE,   L"Shake to locate (grow cursor)" },
@@ -1593,6 +1547,16 @@ static void drawRemove(const DRAWITEMSTRUCT* d) {
     SelectObject(dc, g_font);
     DrawTextW(dc, L"Remove", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
+static void drawSelPill(const DRAWITEMSTRUCT* d) {   // Buttons-page selector tab
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    bool sel = (int)d->CtlID - ID_SEL_BASE == g_selBtn;
+    HBRUSH bg = CreateSolidBrush(C_BG); FillRect(dc, &rc, bg); DeleteObject(bg);
+    fillRound(dc, rc, rc.bottom - rc.top, sel ? C_ACCENT : C_CARD);
+    std::wstring lbl; for (auto& r : g_rows) if (r.ctrl == d->hwndItem) { lbl = r.label; break; }
+    SetBkMode(dc, TRANSPARENT); SelectObject(dc, g_font);
+    SetTextColor(dc, sel ? RGB(255, 255, 255) : C_TEXT2);
+    DrawTextW(dc, lbl.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
 // ---- custom dark dropdown popup ----
 static std::vector<std::wstring> g_popItems;
 static int g_popCur = 0, g_popHover = -1, g_popSel = -2, g_popItemH = 34, g_popTop = 8;
@@ -1709,9 +1673,8 @@ static void PaintWindow(HWND hwnd, HDC hdc) {
     SelectObject(dc, g_fontTitle); SetTextColor(dc, C_TEXT);
     TextOutW(dc, P(SB_W + 28), P(22), kPageNames[g_page], lstrlenW(kPageNames[g_page]));
 
-    int cardL = P(SB_W + 28), cardR = P(WIN_W - 28), sy = g_scrollY;
-    RECT clip = { cardL - P(20), P(56), cr.right, cr.bottom - P(34) };
-    IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
+    int cardL = P(SB_W + 28), cardR = P(WIN_W - 28);
+    auto isRow = [](const UiRow& r) { return r.kind != 4 && r.kind != 6; };   // capture/selector are standalone
     auto drawCard = [&](int card, int top, int bot) {
         if (const wchar_t* hdr = cardHeader(g_page, card)) {
             SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
@@ -1720,32 +1683,28 @@ static void PaintWindow(HWND hwnd, HDC hdc) {
         RECT c = { cardL, top, cardR, bot }; fillRound(dc, c, P(14), C_CARD);
     };
     int curCard = -999, top = 0, bot = 0;
-    for (auto& r : g_rows) if (r.page == g_page && r.kind != 4) {
-        if (r.card != curCard) { if (curCard != -999) drawCard(curCard, top, bot); curCard = r.card; top = r.top - P(8) - sy; }
-        bot = r.top + r.h + P(8) - sy;
+    for (auto& r : g_rows) if (r.page == g_page && isRow(r)) {
+        if (r.card != curCard) { if (curCard != -999) drawCard(curCard, top, bot); curCard = r.card; top = r.top - P(8); }
+        bot = r.top + r.h + P(8);
     }
     if (curCard != -999) drawCard(curCard, top, bot);
 
     curCard = -999;
-    int vT = P(56), vB = cr.bottom - P(34);
     HPEN line = CreatePen(PS_SOLID, 1, C_LINE);
-    for (auto& r : g_rows) if (r.page == g_page && r.kind != 4) {
-        bool vis = rowVisible(r, vT, vB);   // draw label/separator only when its control is shown
-        int ly = r.top - sy;
-        if (vis && r.card == curCard) {
+    for (auto& r : g_rows) if (r.page == g_page && isRow(r)) {
+        int ly = r.top;
+        if (r.card == curCard) {
             HGDIOBJ op = SelectObject(dc, line);
             MoveToEx(dc, cardL + P(18), ly, nullptr); LineTo(dc, cardR - P(14), ly);
             SelectObject(dc, op);
         }
         curCard = r.card;
-        if (!vis) continue;
         int ctlW = r.kind == 0 ? P(46) : r.kind == 1 ? P(194) : r.kind == 5 ? P(120) : P(250);
         RECT lr = { cardL + P(18), ly, cardR - ctlW - P(12), ly + r.h };
         SelectObject(dc, g_font); SetTextColor(dc, C_TEXT);
         DrawTextW(dc, r.label.c_str(), -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
     DeleteObject(line);
-    SelectClipRgn(dc, nullptr);
 
     SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
     RECT fr = { cardL, cr.bottom - P(28), cardR, cr.bottom - P(8) };
@@ -1774,7 +1733,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DRAWITEM: {
         const DRAWITEMSTRUCT* di = (const DRAWITEMSTRUCT*)lParam;
         for (auto& r : g_rows) if (r.ctrl == di->hwndItem) {
-            if (r.kind == 0) drawToggle(di); else if (r.kind == 1) drawDropdown(di); else if (r.kind == 5) drawRemove(di);
+            if (r.kind == 0) drawToggle(di); else if (r.kind == 1) drawDropdown(di); else if (r.kind == 5) drawRemove(di); else if (r.kind == 6) drawSelPill(di);
             return TRUE;
         }
         return TRUE;
@@ -1804,15 +1763,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hoverItem != -1) { g_hoverItem = -1; RECT s = { 0, 0, P(SB_W), 10000 }; InvalidateRect(hwnd, &s, TRUE); }
         return 0;
 
-    case WM_APP + 3: {   // wheel over our own window -> scroll the page
-        int mx = maxScroll(hwnd);
-        if (mx <= 0) return 0;
-        g_scrollY -= (int)(short)wParam / WHEEL_DELTA * P(64);
-        if (g_scrollY < 0) g_scrollY = 0; if (g_scrollY > mx) g_scrollY = mx;
-        relayout(hwnd);
-        return 0;
-    }
-
     case WM_HSCROLL:
         if ((HWND)lParam == GetDlgItem(hwnd, ID_PSPEED)) {
             int pos = HIWORD(wParam);
@@ -1828,9 +1778,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (id == IDM_QUIT)   { DestroyWindow(hwnd); return 0; }
         if (id == IDM_TOGGLE) { { std::lock_guard<std::mutex> lock(g_mutex); g_cfg.enabled = !g_cfg.enabled; } SaveConfig(); InvalidateRect(GetDlgItem(hwnd, ID_ENABLE), nullptr, TRUE); return 0; }
         if (code != BN_CLICKED) return 0;
+        if (id >= ID_SEL_BASE && id < ID_SEL_BASE + 100) {       // pick which button to show
+            int mi = id - ID_SEL_BASE;
+            if (mi >= 0 && mi < (int)g_maps.size() && mi != g_selBtn) { g_selBtn = mi; RebuildButtons(hwnd); }
+            return 0;
+        }
         if (id >= ID_DYN_REMOVE && id < ID_DYN_REMOVE + 100) {   // remove a registered button
             int mi = id - ID_DYN_REMOVE;
-            if (mi >= 0 && mi < (int)g_maps.size()) { g_maps.erase(g_maps.begin() + mi); RebuildButtons(hwnd); SaveConfig(); }
+            if (mi >= 0 && mi < (int)g_maps.size()) { g_maps.erase(g_maps.begin() + mi); if (g_selBtn >= (int)g_maps.size()) g_selBtn = (int)g_maps.size() - 1; RebuildButtons(hwnd); SaveConfig(); }
             return 0;
         }
         if (int* v = toggleCfg(id)) {
@@ -1849,7 +1804,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int btn = (int)wParam;
         if (btn == 3 || btn == 4 || btn == 5) {
             bool ex = false; for (auto& m : g_maps) if (m.button == btn) { ex = true; break; }
-            if (!ex) { g_maps.push_back(BtnMap{ btn }); RebuildButtons(hwnd); SaveConfig(); }
+            if (!ex) { g_maps.push_back(BtnMap{ btn }); g_selBtn = (int)g_maps.size() - 1; RebuildButtons(hwnd); SaveConfig(); }
         }
         return 0;
     }

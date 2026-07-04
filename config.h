@@ -9,8 +9,6 @@ struct Config {
     int accel        = 2;   // 0=Off 1=Low 2=Medium 3=High   (builds with sustained scrolling)
     int reverse      = 0;   // natural (reversed) vertical direction
     int horizontal   = 1;   // smooth the horizontal (tilt) wheel too
-    int excludeApps  = 1;   // pass the wheel through for terminals / pro apps
-    std::wstring exclude;   // ';'-separated exe-name substrings to leave native
     int shiftHoriz   = 1;   // Shift + vertical wheel scrolls horizontally
     int ctrlTurbo    = 0;   // Ctrl + wheel = turbo scroll (overrides Ctrl+zoom while on)
     int gestures     = 0;   // Shift/Alt/Alt+Shift + click selection gestures
@@ -51,13 +49,6 @@ static const int kDragPx     = 6;   // movement past this while held = a drag
 static const int kDeskPx     = 180; // horizontal drag per desktop switch
 static const int kSwiftMul   = 4;   // Fast (swift) scroll distance multiplier
 static const int kDragScroll = 3;   // drag-to-pan sensitivity (wheel delta per pixel)
-
-// Apps that scroll by lines or use the wheel to zoom/scrub — smoothing hurts them,
-// so leave the wheel native. Matched as case-insensitive substrings of the exe name.
-static const wchar_t* const kDefaultExclude =
-    L"windowsterminal;conhost;openconsole;cmd.exe;powershell;pwsh;mintty;alacritty;"
-    L"wezterm;hyper;tabby;kitty;premiere;afterfx;photoshop;illustrator;audition;"
-    L"blender;reaper;cubase;ableton;flstudio;fl64;davinci;resolve;unity;unreal";
 
 // Cursor sizes. Regular/Large/Extra-Large are bundled folders; "Small" has no
 // folder and is produced by runtime-downscaling. kSizeScale is the scale applied
