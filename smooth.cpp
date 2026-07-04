@@ -74,12 +74,21 @@ static std::atomic<bool> g_running{true};
 static HHOOK             g_hook   = nullptr;
 static Config           g_cfg;
 
-// physics state (guarded by g_mutex)
-static double   g_remV = 0.0, g_remH = 0.0;    // scroll distance still owed per axis
-static double   g_accV = 0.0, g_accH = 0.0;    // sub-unit remainder per axis
+// Per-axis scroll animation (guarded by g_mutex). Each notch re-plans a cubic
+// Hermite glide: pay `rem` over the next `R` ms, entering at `vel` and landing
+// at exactly zero velocity — smooth start, smooth stop, no tail creep.
+struct ScrollAxis {
+    double rem = 0.0;   // distance still owed (wheel units)
+    double vel = 0.0;   // current payout velocity (units/ms)
+    double R   = 0.0;   // time left in the current plan (ms)
+};
+static ScrollAxis g_axV, g_axH;
+static double   g_accV = 0.0, g_accH = 0.0;    // sub-unit emission remainder (anim thread only)
 static double   g_burstV = 0.0, g_burstH = 0.0;// recent-scroll accumulator (acceleration)
-static LONGLONG g_lastV = 0,  g_lastH = 0;     // last notch time (QPC ticks)
+static LONGLONG g_lastV = 0,  g_lastH = 0;     // last notch time (QPC ticks, hook thread only)
 static LONGLONG g_qpcFreq = 1;
+static HANDLE   g_wake = nullptr;              // pokes the anim thread out of its idle park
+static DWORD    g_hookTid = 0;                 // dedicated WH_MOUSE_LL thread id
 
 // click-gesture request, produced in the hook and consumed by the animation thread
 static std::atomic<int> g_gesture{0};          // 0 none · 1 word · 2 line · 3 word+copy
@@ -132,21 +141,24 @@ static int                g_sysSpeed = 10;     // system pointer speed at launch
 static int                g_origMouse[3] = { 6, 10, 1 };  // saved accel params to restore
 static ULONG_PTR          g_gdiplus = 0;       // GDI+ token (high-quality cursor scaling)
 
-// near-black premium palette (SQL-Studio-style) + bright blue accent
+// near-black premium palette (SQL-Studio-style) + violet accent
 static const COLORREF C_SIDE   = RGB(0x0b, 0x0b, 0x0d);
 static const COLORREF C_BG     = RGB(0x0f, 0x0f, 0x12);
-static const COLORREF C_CARD   = RGB(0x17, 0x17, 0x1b);
-static const COLORREF C_LINE   = RGB(0x26, 0x26, 0x2c);
+static const COLORREF C_CARD   = RGB(0x18, 0x18, 0x1e);
+static const COLORREF C_CARD2  = RGB(0x1f, 0x1f, 0x27);   // inset control fill (dropdowns)
+static const COLORREF C_LINE   = RGB(0x2a, 0x2a, 0x32);   // card / control borders
 static const COLORREF C_HOVER  = RGB(0x1e, 0x1e, 0x23);
-static const COLORREF C_TEXT   = RGB(0xf2, 0xf2, 0xf5);
-static const COLORREF C_TEXT2  = RGB(0x82, 0x82, 0x8c);
-static const COLORREF C_ACCENT = RGB(0x2f, 0x8f, 0xff);
+static const COLORREF C_TEXT   = RGB(0xf4, 0xf4, 0xf7);
+static const COLORREF C_TEXT2  = RGB(0x87, 0x87, 0x92);
+static const COLORREF C_ACCENT = RGB(0x8b, 0x5c, 0xf6);   // violet-500 primary
+static const COLORREF C_ACCENT2= RGB(0xa7, 0x8c, 0xfa);   // violet-400 (gradient top)
+static const COLORREF C_SELBG  = RGB(0x21, 0x1c, 0x38);   // selected sidebar tint (violet)
 static const COLORREF C_KNOB   = RGB(0x3a, 0x3a, 0x42);
 static HBRUSH g_brSide = nullptr, g_brBg = nullptr;
 
 // declarative rows -> lets WM_PAINT draw cards + labels from stored geometry.
 // top/h = row rect; cx/cy/ch = the control's own rect (for scroll repositioning).
-struct UiRow { int page, card, kind, top, h, cx, cy, ch; HWND ctrl; std::wstring label; };  // kind: 0 toggle,1 dropdown,2 slider,4 capture,5 remove,6 selector pill
+struct UiRow { int page, card, kind, top, h, cx, cy, ch; HWND ctrl; std::wstring label; std::wstring desc; };  // kind: 0 toggle,1 dropdown,2 slider,4 capture,5 remove,6 selector pill
 static std::vector<UiRow> g_rows;
 static int g_selBtn = 0;   // Buttons page: which registered button is shown
 
@@ -168,13 +180,48 @@ static const char* IC_GEN[] = {
     "m21.318 7.141l-.494-.856c-.373-.648-.56-.972-.878-1.101c-.317-.13-.676-.027-1.395.176l-1.22.344c-.459.106-.94.046-1.358-.17l-.337-.194a2 2 0 0 1-.788-.967l-.334-.998c-.22-.66-.33-.99-.591-1.178c-.261-.19-.609-.19-1.303-.19h-1.115c-.694 0-1.041 0-1.303.19c-.261.188-.37.518-.59 1.178l-.334.998a2 2 0 0 1-.789.967l-.337.195c-.418.215-.9.275-1.358.17l-1.22-.345c-.719-.203-1.078-.305-1.395-.176c-.318.129-.505.453-.878 1.1l-.493.857c-.35.608-.525.911-.491 1.234c.034.324.268.584.736 1.105l1.031 1.153c.252.319.431.875.431 1.375s-.179 1.056-.43 1.375l-1.032 1.152c-.468.521-.702.782-.736 1.105s.14.627.49 1.234l.494.857c.373.647.56.971.878 1.1s.676.028 1.395-.176l1.22-.344a2 2 0 0 1 1.359.17l.336.194c.36.23.636.57.788.968l.334.997c.22.66.33.99.591 1.18c.262.188.609.188 1.303.188h1.115c.694 0 1.042 0 1.303-.189s.371-.519.59-1.179l.335-.997c.152-.399.428-.738.788-.968l.336-.194c.42-.215.9-.276 1.36-.17l1.22.344c.718.204 1.077.306 1.394.177c.318-.13.505-.454.878-1.101l.493-.857c.35-.607.525-.91.491-1.234s-.268-.584-.736-1.105l-1.031-1.152c-.252-.32-.431-.875-.431-1.375s.179-1.056.43-1.375l1.032-1.153c.468-.52.702-.781.736-1.105s-.14-.626-.49-1.234Z",
     "M15.52 12a3.5 3.5 0 1 1-7 0a3.5 3.5 0 0 1 7 0Z" };
 
+static const char* IC_HEART[] = {
+    "M12.62 20.81c-.34.12-.9.12-1.24 0C8.48 19.82 2 15.69 2 8.69C2 5.6 4.49 3.1 7.56 3.1c1.82 0 3.43.88 4.44 2.24c1.01-1.36 2.62-2.24 4.44-2.24C19.51 3.1 22 5.6 22 8.69c0 7-6.48 11.13-9.38 12.12Z" };
+
+// About-page link-row icons (stroke, 24x24 viewBox).
+static const char* IC_GLOBE[] = {
+    "M2.5 12a9.5 9.5 0 1 0 19 0a9.5 9.5 0 1 0-19 0Z",
+    "M8 12c0 5.25 1.79 9.5 4 9.5s4-4.25 4-9.5s-1.79-9.5-4-9.5s-4 4.25-4 9.5Z",
+    "M3 9h18M3 15h18" };
+static const char* IC_MAIL[] = {
+    "M2.5 8c0-1.1.9-2 2-2h15c1.1 0 2 .9 2 2v8c0 1.1-.9 2-2 2h-15c-1.1 0-2-.9-2-2z",
+    "m3.5 7.5l7.1 4.9c.85.6 2 .6 2.85 0L20.5 7.5" };
+static const char* IC_GITHUB[] = {
+    "M12 2C6.48 2 2 6.48 2 12c0 4.42 2.87 8.17 6.84 9.5c.5.09.68-.22.68-.48c0-.24-.01-.87-.01-1.71c-2.78.6-3.37-1.34-3.37-1.34c-.45-1.16-1.11-1.47-1.11-1.47c-.91-.62.07-.61.07-.61c1 .07 1.53 1.03 1.53 1.03c.89 1.53 2.34 1.09 2.91.83c.09-.65.35-1.09.63-1.34c-2.22-.25-4.55-1.11-4.55-4.94c0-1.09.39-1.98 1.03-2.68c-.1-.25-.45-1.27.1-2.65c0 0 .84-.27 2.75 1.02c.8-.22 1.65-.33 2.5-.33s1.7.11 2.5.33c1.91-1.29 2.75-1.02 2.75-1.02c.55 1.38.2 2.4.1 2.65c.64.7 1.03 1.59 1.03 2.68c0 3.84-2.34 4.69-4.57 4.94c.36.31.68.92.68 1.85c0 1.34-.01 2.42-.01 2.75c0 .27.18.58.69.48A10.01 10.01 0 0 0 22 12c0-5.52-4.48-10-10-10Z" };
+static const char* IC_UPDATE[] = {
+    "M3 12a9 9 0 0 1 15.5-6.2L21 8M21 3v5h-5",
+    "M21 12a9 9 0 0 1-15.5 6.2L3 16m0 5v-5h5" };
+
 struct SvgIcon { const char* const* paths; int n; };
-static const SvgIcon kIcons[5] = {
-    { IC_SCROLL, 2 }, { IC_POINTER, 1 }, { IC_CLICK, 2 }, { IC_MOD, 1 }, { IC_GEN, 2 }
+static const SvgIcon kIcons[6] = {
+    { IC_SCROLL, 2 }, { IC_POINTER, 1 }, { IC_CLICK, 2 }, { IC_MOD, 1 }, { IC_GEN, 2 }, { IC_HEART, 1 }
 };
-static const SvgIcon kMouseIcon = { IC_MOUSE, 2 };   // app / tray icon
-static const wchar_t* const kPageNames[5] = { L"Scrolling", L"Pointer", L"Buttons", L"Modifier Keys", L"General" };
-static const int kNumPages = 5;
+static const SvgIcon kMouseIcon  = { IC_MOUSE, 2 };   // app / tray icon
+static const SvgIcon kGlobeIcon  = { IC_GLOBE, 3 };
+static const SvgIcon kMailIcon   = { IC_MAIL, 2 };
+static const SvgIcon kGithubIcon = { IC_GITHUB, 1 };
+static const SvgIcon kUpdateIcon = { IC_UPDATE, 2 };
+static const wchar_t* const kPageNames[6] = { L"Scrolling", L"Pointer", L"Buttons", L"Modifier Keys", L"General", L"About" };
+static const wchar_t* const kPageSubs[6] = {
+    L"Momentum, speed, and scroll direction",
+    L"Cursor movement and appearance",
+    L"Remap extra mouse buttons to actions",
+    L"Actions while holding a key",
+    L"App startup and system behaviour",
+    L"Version, credits, and support" };
+static const int kNumPages = 6;
+#define PAGE_ABOUT 5
+
+#define APP_VERSION L"0.1.0"
+static const wchar_t* const URL_DONATE  = L"https://nischal-dahal.com.np/donate";
+static const wchar_t* const URL_WEBSITE = L"https://nischal-dahal.com.np";
+static const wchar_t* const URL_GITHUB  = L"https://github.com/broisnischal/smooly";
+static const wchar_t* const CONTACT_EMAIL = L"nischaldahal01395@gmail.com";
 
 #define ID_ENABLE  1001
 #define ID_SMOOTH  1002
@@ -190,6 +237,11 @@ static const int kNumPages = 5;
 #define ID_GESTURE 1013
 #define ID_PSPEED  1015
 #define ID_NOACCEL 1016
+#define ID_HSPEED  1023
+#define ID_DONATE  1030
+#define ID_WEBSITE 1031
+#define ID_GITHUB  1032
+#define ID_EMAIL   1033
 #define ID_CAPTURE 1022
 #define ID_DYN_BASE 3000   // dynamic button dropdowns: 3000 + mapIndex*8 + trigger(0..3)
 #define ID_SEL_BASE 3700   // 3700 + mapIndex = Buttons-page selector pill
@@ -225,6 +277,7 @@ static void LoadConfig() {
     g_cfg.reverse    = GetPrivateProfileIntW(L"scroll", L"reverse",    0, p.c_str());
     g_cfg.horizontal = GetPrivateProfileIntW(L"scroll", L"horizontal", 1, p.c_str());
     g_cfg.shiftHoriz = GetPrivateProfileIntW(L"scroll", L"shiftHoriz", 1, p.c_str());
+    g_cfg.hspeed     = GetPrivateProfileIntW(L"scroll", L"hspeed",     1, p.c_str());
     g_cfg.ctrlTurbo  = GetPrivateProfileIntW(L"scroll", L"ctrlTurbo",  0, p.c_str());
     g_cfg.gestures   = GetPrivateProfileIntW(L"scroll", L"gestures",   0, p.c_str());
     g_cfg.shake      = GetPrivateProfileIntW(L"scroll", L"shake",      1, p.c_str());
@@ -266,7 +319,8 @@ static void SaveConfig() {
     W(L"enabled", g_cfg.enabled);   W(L"smoothness", g_cfg.smoothness);
     W(L"speed",   g_cfg.speed);     W(L"accel",      g_cfg.accel);
     W(L"reverse", g_cfg.reverse);   W(L"horizontal", g_cfg.horizontal);
-    W(L"shiftHoriz", g_cfg.shiftHoriz); W(L"ctrlTurbo", g_cfg.ctrlTurbo);
+    W(L"shiftHoriz", g_cfg.shiftHoriz); W(L"hspeed", g_cfg.hspeed);
+    W(L"ctrlTurbo", g_cfg.ctrlTurbo);
     W(L"gestures", g_cfg.gestures);
     W(L"shake",   g_cfg.shake);
     W(L"startup", g_cfg.startup);
@@ -481,8 +535,10 @@ static void DetectShake(const MSLLHOOKSTRUCT* ms) {
         int cnt = 0;
         for (LONGLONG t : sRev)
             if (t != 0 && ticksToMs(now - t) <= kShakeWindowMs) cnt++;
-        if (cnt >= kShakeMinReversals)
+        if (cnt >= kShakeMinReversals) {
             g_bigUntil.store(now + (LONGLONG)kShakeHoldMs * g_qpcFreq / 1000);
+            if (g_wake) SetEvent(g_wake);      // unpark the anim thread to run the zoom
+        }
     }
     sSign = sign;
 }
@@ -664,13 +720,56 @@ static bool ApplyCursorTheme(const std::wstring& name) {
     return ok;
 }
 
-static BtnMap* findMap(int button) {         // g_maps is GUI-thread only (hook + UI)
+// g_maps is written by the GUI thread and read by the hook thread: hold g_mutex
+// for hook-side reads and GUI-side writes (GUI-side reads need no lock).
+static BtnMap* findMap(int button) {
     for (auto& m : g_maps) if (m.button == button) return &m;
     return nullptr;
 }
-static int scrollActionFor(int button) { BtnMap* m = findMap(button); return m ? m->scroll : 0; }
 static int nativeClick(int button) { return button == 3 ? 1 : button == 4 ? 4 : 5; }  // middle/back/forward
 static void fireAct(int action, int combo, const std::wstring& text);
+
+static void wakeAnim() { if (g_wake) SetEvent(g_wake); }
+
+// Add scroll distance to an axis and (re)plan its glide. Caller holds g_mutex.
+// Every notch restarts the payout window and the plan launches at no less than
+// the window's average speed — instant response — while momentum carried in
+// `vel` from previous notches keeps sustained scrolling one continuous motion.
+// The cubic lands at exactly zero velocity, so the glide can't creep or cliff.
+static void queueScroll(ScrollAxis& ax, double dist, double cap) {
+    if ((dist > 0 && ax.rem < 0) || (dist < 0 && ax.rem > 0)) { ax.rem = 0; ax.vel = 0; }  // crisp reversal
+    ax.rem += dist;
+    if (ax.rem >  cap) ax.rem =  cap;
+    if (ax.rem < -cap) ax.rem = -cap;
+    int s = (g_cfg.smoothness >= 1 && g_cfg.smoothness <= 5) ? g_cfg.smoothness : 3;
+    ax.R = kDurBySmoothness[s];
+    double vAvg = ax.rem / ax.R, vMax = 3.0 * ax.rem / ax.R;   // vel > 3D/T makes the cubic overshoot
+    if (ax.rem > 0) { if (ax.vel < vAvg) ax.vel = vAvg; else if (ax.vel > vMax) ax.vel = vMax; }
+    else            { if (ax.vel > vAvg) ax.vel = vAvg; else if (ax.vel < vMax) ax.vel = vMax; }
+    wakeAnim();
+}
+
+// Injected wheel events reach elevated windows only from an elevated process
+// (UIPI): SendInput just vanishes there. If we can't open the process under the
+// cursor, swallowing its notches would kill scrolling entirely (Task Manager,
+// regedit, admin terminals) — pass raw input through instead. Cached per root
+// window; the hook thread is the only toucher.
+static bool cursorOverProtectedWindow(POINT pt) {
+    static HWND lastRoot = nullptr; static bool lastProt = false;
+    HWND w = WindowFromPoint(pt);
+    if (!w) return false;
+    HWND root = GetAncestor(w, GA_ROOT);
+    if (root == lastRoot) return lastProt;
+    DWORD pid = 0; GetWindowThreadProcessId(root, &pid);
+    bool prot = false;
+    if (pid && pid != GetCurrentProcessId()) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (h) CloseHandle(h);
+        else prot = (GetLastError() == ERROR_ACCESS_DENIED);
+    }
+    lastRoot = root; lastProt = prot;
+    return prot;
+}
 
 // ------------------------------------------------------------------ engine
 LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -710,14 +809,18 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     case WM_MBUTTONDOWN:
     case WM_XBUTTONDOWN: {
         int btn = (wParam == WM_MBUTTONDOWN) ? 3 : (HIWORD(ms->mouseData) == XBUTTON1 ? 4 : 5);
-        BtnMap* m = findMap(btn);
-        if (!m) break;                         // unmanaged -> native (lets the capture box register it)
-        if (!m->click && !m->dbl && !m->hold && !m->scroll && !m->drag) break;   // all default -> native
-        g_pBtn.store(btn); g_pDownAt.store(nowTicks());
-        g_pHoldFired.store(false); g_pScrolled.store(false); g_pDragged.store(false);
-        g_pHoldAction.store(m->hold); g_pHoldCombo.store(m->keyH); g_pDragAction.store(m->drag);
-        { std::lock_guard<std::mutex> lock(g_mutex); g_pHoldText = m->txtH; }
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            BtnMap* m = findMap(btn);
+            if (!m) break;                     // unmanaged -> native (lets the capture box register it)
+            if (!m->click && !m->dbl && !m->hold && !m->scroll && !m->drag) break;   // all default -> native
+            g_pBtn.store(btn); g_pDownAt.store(nowTicks());
+            g_pHoldFired.store(false); g_pScrolled.store(false); g_pDragged.store(false);
+            g_pHoldAction.store(m->hold); g_pHoldCombo.store(m->keyH); g_pDragAction.store(m->drag);
+            g_pHoldText = m->txtH;
+        }
         g_dragLastX = ms->pt.x; g_dragLastY = ms->pt.y; g_dragTotal = 0; g_dragAccX = 0;
+        wakeAnim();                            // the anim thread times the Hold gesture
         return 1;                              // swallow; decide click / hold / scroll / drag
     }
     case WM_MBUTTONUP:
@@ -726,10 +829,14 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (g_pBtn.load() != btn) break;
         g_pBtn.store(0);
         if (g_pScrolled.load() || g_pHoldFired.load() || g_pDragged.load()) return 1;  // consumed
-        BtnMap* m = findMap(btn);
-        int clickAct = (m && m->click != 0) ? m->click : nativeClick(btn);
-        int clickCombo = m ? m->keyC : 0; std::wstring clickText = m ? m->txtC : L"";
-        int dblAct = m ? m->dbl : 0, dblCombo = m ? m->keyD : 0; std::wstring dblText = m ? m->txtD : L"";
+        int clickAct, clickCombo, dblAct, dblCombo; std::wstring clickText, dblText;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            BtnMap* m = findMap(btn);
+            clickAct = (m && m->click != 0) ? m->click : nativeClick(btn);
+            clickCombo = m ? m->keyC : 0; clickText = m ? m->txtC : L"";
+            dblAct = m ? m->dbl : 0; dblCombo = m ? m->keyD : 0; dblText = m ? m->txtD : L"";
+        }
         LONGLONG now = nowTicks();
         if (dblAct != 0 && btn == g_lastClickBtn && ticksToMs(now - g_lastClickAt) <= kDblMs) {
             g_lastClickBtn = 0; g_pendAction.store(0);             // second click -> double
@@ -740,6 +847,7 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_pendAction.store(clickAct); g_pendCombo.store(clickCombo);
                 { std::lock_guard<std::mutex> lock(g_mutex); g_pendText = clickText; }
                 g_pendDeadline.store(now + (LONGLONG)kDblMs * g_qpcFreq / 1000);
+                wakeAnim();                    // the anim thread fires it after kDblMs
             } else fireAct(clickAct, clickCombo, clickText);
         }
         return 1;
@@ -751,7 +859,7 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             bool alt   = GetAsyncKeyState(VK_MENU)  & 0x8000;
             // Shift+click is left native (text range-selection); only Alt gestures.
             int g = (alt && shift) ? 3 : alt ? 2 : 0;
-            if (g) { g_gesture.store(g); suppressUp = true; return 1; }
+            if (g) { g_gesture.store(g); suppressUp = true; wakeAnim(); return 1; }
         }
         break;
 
@@ -768,12 +876,12 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
         int held = g_pBtn.load();                              // Click + Scroll gesture
         if (!horizWheel && held) {
-            int sa = scrollActionFor(held);
+            int sa; { std::lock_guard<std::mutex> lock(g_mutex); BtnMap* m = findMap(held); sa = m ? m->scroll : 0; }
             if (sa != 0) {
                 g_pScrolled.store(true);
-                if (sa == 1) { std::lock_guard<std::mutex> lock(g_mutex); g_remH += (delta > 0 ? -1.0 : 1.0) * kStepBySpeed[g_cfg.speed]; }
-                else if (sa == 2) g_zoomDelta.fetch_add(delta);
-                else if (sa == 3) { std::lock_guard<std::mutex> lock(g_mutex); int dir = delta > 0 ? 1 : -1; if (g_cfg.reverse) dir = -dir; g_remV += dir * kStepBySpeed[g_cfg.speed] * kSwiftMul; }
+                if (sa == 1) { std::lock_guard<std::mutex> lock(g_mutex); double st = kStepBySpeed[g_cfg.speed] * kHSpeedMul[(g_cfg.hspeed >= 0 && g_cfg.hspeed < 3) ? g_cfg.hspeed : 1]; queueScroll(g_axH, (delta > 0 ? -st : st), st * kMaxNotchStack); }
+                else if (sa == 2) { g_zoomDelta.fetch_add(delta); wakeAnim(); }
+                else if (sa == 3) { std::lock_guard<std::mutex> lock(g_mutex); int dir = delta > 0 ? 1 : -1; if (g_cfg.reverse) dir = -dir; double st = kStepBySpeed[g_cfg.speed] * kSwiftMul; queueScroll(g_axV, dir * st, st * kMaxNotchStack); }
                 return 1;
             }
         }
@@ -783,17 +891,28 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         // hidden keeps scrolling latency-free.
         if (g_wnd && IsWindowVisible(g_wnd)) { HWND wu = WindowFromPoint(ms->pt); if (wu && GetAncestor(wu, GA_ROOT) == g_wnd) break; }
 
-        std::lock_guard<std::mutex> lock(g_mutex);
+        // g_cfg ints and the accel state (burst/last) are only ever written from one
+        // thread at a time and read here — the hot path stays lock-free; only the
+        // axis plans are shared with the animation thread.
         if (!g_cfg.enabled || g_cfg.smoothness == 0) break;
         if (horizWheel && !g_cfg.horizontal) break;
 
-        bool toHoriz = horizWheel || (shift && g_cfg.shiftHoriz && g_cfg.horizontal);
+        // UIPI: we can't inject into elevated windows — swallowing here would kill
+        // scrolling over Task Manager / regedit / admin terminals. Pass through.
+        if (cursorOverProtectedWindow(ms->pt)) break;
+
+        // Shift+wheel -> horizontal is emitted as a *vertical* wheel so the app applies
+        // its own Shift->horizontal flip. Emitting HWHEEL while Shift is physically held
+        // makes apps (browsers) flip the axis back to vertical. Only the physical tilt
+        // wheel emits HWHEEL directly (no modifier to confuse the app).
+        bool shiftScroll = shift && g_cfg.shiftHoriz && !horizWheel;
+        bool toHoriz = horizWheel;
         double step  = kStepBySpeed[g_cfg.speed];
+        double hMul  = (horizWheel || shiftScroll) ? kHSpeedMul[(g_cfg.hspeed >= 0 && g_cfg.hspeed < 3) ? g_cfg.hspeed : 1] : 1.0;
 
         LONGLONG  now  = nowTicks();
         LONGLONG& last = toHoriz ? g_lastH : g_lastV;
         double&   burst= toHoriz ? g_burstH : g_burstV;
-        double&   rem  = toHoriz ? g_remH : g_remV;
         double interval = last ? ticksToMs(now - last) : 1e9;
         last = now;
 
@@ -807,19 +926,20 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             boost = 1.0 + amount * ramp;
         }
 
-        int dir;
-        if (horizWheel)   dir = (delta > 0) ? 1 : -1;
-        else if (toHoriz) dir = (delta > 0) ? -1 : 1;   // Shift+wheel: up = left, down = right
-        else            { dir = (delta > 0) ? 1 : -1; if (g_cfg.reverse) dir = -dir; }
+        int dir;   // shift-scroll emits vertical (the app flips it), so it uses the vertical direction
+        if (horizWheel) dir = (delta > 0) ? 1 : -1;
+        else          { dir = (delta > 0) ? 1 : -1; if (g_cfg.reverse) dir = -dir; }
 
-        double dist = dir * step * boost;
-        double cap  = step * kMaxNotchStack;
-        if (ctrl && g_cfg.ctrlTurbo) { dist *= kTurboFactor; cap *= kTurboFactor; }
+        double dist = dir * step * boost * hMul;
+        if (ctrl && g_cfg.ctrlTurbo) dist *= kTurboFactor;
+        // backlog cap: at most 9 notches of *this size* owed, so accelerated
+        // scrolling isn't silently clipped (page must track the wheel)
+        double cap  = std::fabs(dist) * kMaxNotchStack;
 
-        if ((dist > 0 && rem < 0) || (dist < 0 && rem > 0)) rem = 0;   // crisp reversal
-        rem += dist;
-        if (rem >  cap) rem =  cap;
-        if (rem < -cap) rem = -cap;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            queueScroll(toHoriz ? g_axH : g_axV, dist, cap);
+        }
         return 1;   // swallow the raw notch
     }
     }
@@ -916,12 +1036,24 @@ static void performAct(int action, int combo, const std::wstring& text) {
 static void fireAct(int action, int combo, const std::wstring& text) {
     { std::lock_guard<std::mutex> lock(g_mutex); g_act.action = action; g_act.combo = combo; g_act.text = text; }
     g_actReady.store(true);
+    wakeAnim();
 }
 
 static void AnimationLoop() {
+    // Evenly spaced synthetic events are what "smooth" means to the eye: raise the
+    // priority so paints/IO can't preempt a frame, and pace with a high-resolution
+    // waitable timer (sub-ms, Win10 1803+) instead of sleep_for (~1ms overshoot,
+    // which ran the old loop at ~105Hz instead of 120).
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     timeBeginPeriod(1);
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    HANDLE hrTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     LONGLONG prev = nowTicks();
     const double frameMs = 1000.0 / kFrameHz;
+    const LONGLONG frameTicks = (LONGLONG)(g_qpcFreq / (double)kFrameHz);
+    LONGLONG nextDue = 0;   // absolute QPC deadline of the next frame (0 = re-anchor)
 
     while (g_running.load()) {
         LONGLONG cur = nowTicks();
@@ -989,35 +1121,91 @@ static void AnimationLoop() {
         }
 
         double emitV = 0.0, emitH = 0.0;
+        bool scrollBusy;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            double k = kRateBySmoothness[g_cfg.smoothness > 0 ? g_cfg.smoothness : 1];
-            double eased = 1.0 - std::exp(-k * dt);   // fraction of the owed distance this frame
-            double floorStep = kMinScrollSpeed * dt;  // but never slower than this
-
-            auto pay = [&](double& rem) -> double {
-                if (rem == 0.0) return 0.0;
-                double move = rem * eased;
-                double fl   = (rem > 0 ? floorStep : -floorStep);
-                if (std::fabs(fl) > std::fabs(rem)) fl = rem;       // don't overshoot
-                if (std::fabs(move) < std::fabs(fl)) move = fl;     // enforce min finishing speed
-                rem -= move;
-                if (std::fabs(rem) < 0.5) { move += rem; rem = 0.0; }
+            double dtMs = dt * 1000.0;
+            // Evaluate the axis plan over this frame. Re-deriving the cubic from the
+            // *current* state (rem, vel, time left) each frame is exact — a cubic is
+            // uniquely determined by its two endpoint positions and velocities — and
+            // keeps the code incremental instead of tracking a start-of-plan pose.
+            auto pay = [&](ScrollAxis& ax) -> double {
+                if (ax.rem == 0.0) { ax.vel = 0; ax.R = 0; return 0.0; }
+                if (ax.R <= dtMs) { double m = ax.rem; ax.rem = 0; ax.vel = 0; ax.R = 0; return m; }
+                double D = ax.rem, c = ax.vel * ax.R;       // s(u) = a·u³ + b·u² + c·u, u = t/R
+                double a = c - 2.0 * D, b = 3.0 * D - 2.0 * c;
+                double u = dtMs / ax.R;
+                double move = ((a * u + b) * u + c) * u;
+                ax.vel  = ((3.0 * a * u + 2.0 * b) * u + c) / ax.R;   // s'(u)/R
+                ax.rem -= move;
+                ax.R   -= dtMs;
+                if (std::fabs(ax.rem) < 0.5) { move += ax.rem; ax.rem = 0; ax.vel = 0; ax.R = 0; }
                 return move;
             };
-            emitV = pay(g_remV);
-            emitH = pay(g_remH);
+            emitV = pay(g_axV);
+            emitH = pay(g_axH);
+            scrollBusy = (g_axV.rem != 0.0) || (g_axH.rem != 0.0);
         }
         if (emitV != 0.0) { g_accV += emitV; int w = (int)g_accV; g_accV -= w; if (w) EmitWheel(false, w); }
         if (emitH != 0.0) { g_accH += emitH; int w = (int)g_accH; g_accH -= w; if (w) EmitWheel(true,  w); }
 
-        // Sleep the *remainder* of the frame so events go out evenly spaced. Sleeping a
-        // fixed frameMs after variable work makes the period drift -> jittery scrolling.
-        double sleepMs = frameMs - ticksToMs(nowTicks() - cur);
-        if (sleepMs > 0.3) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(sleepMs));
+        // Idle park: nothing moving and nothing timed pending -> block on the wake
+        // event (the hook signals it) instead of burning 120 frames/s forever.
+        bool busy = scrollBusy || g_shakeScale > 1.0
+                 || (g_cfg.shake && g_bigUntil.load() > cur)
+                 || g_pBtn.load() || g_pendAction.load() || g_gesture.load() || g_actReady.load()
+                 || g_zoomDelta.load() || g_panV.load() || g_panH.load() || g_dragCmd.load();
+        if (!busy) {
+            nextDue = 0;
+            WaitForSingleObjectEx(g_wake, 100, FALSE);
+            prev = nowTicks();   // don't count the park as animation time
+            continue;
+        }
+
+        // Pace to an *absolute* frame deadline so events go out evenly spaced —
+        // sleeping a fixed amount after variable work makes the period drift.
+        if (nextDue == 0) nextDue = cur + frameTicks;
+        else { nextDue += frameTicks; if (nextDue < cur) nextDue = cur + frameTicks; }  // re-anchor after a stall
+        LONGLONG wait = nextDue - nowTicks();
+        if (wait > 0) {
+            if (hrTimer) {
+                LARGE_INTEGER due; due.QuadPart = -((wait * 10000000LL) / g_qpcFreq);   // relative, 100ns units
+                SetWaitableTimer(hrTimer, &due, 0, nullptr, nullptr, FALSE);
+                WaitForSingleObjectEx(hrTimer, 50, FALSE);
+            } else {
+                std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(ticksToMs(wait)));
+            }
+        }
     }
     if (g_cursorBig) { FreeShakeBase(); RestoreCursors(); g_cursorBig = false; }
+    if (hrTimer) CloseHandle(hrTimer);
     timeEndPeriod(1);
+}
+
+// ---------------------------------------------------------------- hook thread
+// The LL hook lives on its own always-pumping, time-critical thread so GUI work
+// (paints, modal loops, config writes) can never delay mouse input. If a hook
+// thread ever stalls past LowLevelHooksTimeout, Windows silently stops calling
+// the hook and scrolling "randomly" reverts to native — invisible to us — so a
+// watchdog timer also re-installs the hook every 2 minutes.
+static HANDLE g_hookReady = nullptr;   // signaled once the install attempt finished
+static void HookThread(HINSTANCE hInst) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    g_hookTid = GetCurrentThreadId();
+    g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, hInst, 0);
+    SetEvent(g_hookReady);
+    if (!g_hook) return;
+    SetTimer(nullptr, 0, 120000, nullptr);       // watchdog ticks into this queue
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0)) {
+        if (m.message == WM_TIMER) {             // re-hook (harmless if still alive)
+            UnhookWindowsHookEx(g_hook);
+            g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, hInst, 0);
+            continue;
+        }
+        TranslateMessage(&m); DispatchMessageW(&m);
+    }
+    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
 }
 
 // ------------------------------------------------------------------ tray icon
@@ -1062,7 +1250,8 @@ static HICON CreateBrandIcon() {
 }
 
 // ------------------------------------------------------------------ GUI
-static const int SB_W = 200, ROW_H = 46, CARD_GAP = 16, WIN_W = 720, WIN_H = 560;
+static const int SB_W = 200, ROW_H = 52, CARD_GAP = 16, WIN_W = 720, WIN_H = 620;
+static const int CONTENT_TOP = 72, CONTENT_BOT = WIN_H - 40;   // vertical band the cards are centred within
 
 static int* toggleCfg(int id) {
     switch (id) {
@@ -1100,6 +1289,7 @@ static bool ddInfo(int id, DdInfo& d) {
     switch (id) {
     case ID_SMOOTH: d.val = &g_cfg.smoothness; d.opts = sm; d.n = 6; return true;
     case ID_SPEED:  d.val = &g_cfg.speed;      d.opts = sp; d.n = 3; return true;
+    case ID_HSPEED: d.val = &g_cfg.hspeed;     d.opts = kHSpeedNames; d.n = 3; return true;
     case ID_ACCEL:  d.val = &g_cfg.accel;      d.opts = ac; d.n = 4; return true;
     case ID_SIZE:   d.val = &g_cfg.size;       d.opts = kSizeNames;     d.n = 4; return true;
     case ID_THEME:  d.theme = true; return true;
@@ -1256,18 +1446,28 @@ LRESULT CALLBACK SliderProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int span = rc.right - 2 * pad; if (span < 1) span = 1;
         int pos = lo + (int)((double)(x - pad) / span * (hi - lo) + 0.5);
         if (pos < lo) pos = lo; if (pos > hi) pos = hi;
+        int old = (int)GetWindowLongPtrW(h, GWLP_USERDATA);
         SetWindowLongPtrW(h, GWLP_USERDATA, pos);
-        InvalidateRect(h, nullptr, TRUE);
-        SendMessageW(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBTRACK, pos), (LPARAM)h);
+        if (pos != old) {                                   // only repaint / re-apply on a real change
+            InvalidateRect(h, nullptr, FALSE);
+            SendMessageW(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBTRACK, pos), (LPARAM)h);
+        }
     };
     switch (m) {
     case WM_ERASEBKGND: return 1;
     case WM_LBUTTONDOWN: SetCapture(h); setFromX((short)LOWORD(l)); return 0;
     case WM_MOUSEMOVE:   if (w & MK_LBUTTON) setFromX((short)LOWORD(l)); return 0;
-    case WM_LBUTTONUP:   ReleaseCapture(); return 0;
+    case WM_LBUTTONUP: {                                    // persist once, on release (no per-pixel disk writes)
+        ReleaseCapture();
+        int pos = (int)GetWindowLongPtrW(h, GWLP_USERDATA);
+        SendMessageW(GetParent(h), WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, pos), (LPARAM)h);
+        return 0;
+    }
     case WM_PAINT: {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
+        HDC dc = CreateCompatibleDC(hdc);                  // double-buffer -> zero flicker while dragging
+        HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom); HGDIOBJ ob = SelectObject(dc, bmp);
         HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &rc, bg); DeleteObject(bg);
         int cy = rc.bottom / 2, span = rc.right - 2 * pad, th = P(4);
         int pos = (int)GetWindowLongPtrW(h, GWLP_USERDATA);
@@ -1275,6 +1475,8 @@ LRESULT CALLBACK SliderProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         RECT track = { pad, cy - th / 2, rc.right - pad, cy + th / 2 };  fillRound(dc, track, th / 2, C_LINE);
         RECT fill  = { pad, cy - th / 2, px, cy + th / 2 };              fillRound(dc, fill,  th / 2, C_ACCENT);
         int r = P(9); fillEllipse(dc, px - r, cy - r, 2 * r, 2 * r, RGB(255, 255, 255));
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, ob); DeleteObject(bmp); DeleteDC(dc);
         EndPaint(h, &ps); return 0;
     }
     }
@@ -1308,7 +1510,14 @@ LRESULT CALLBACK CaptureProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static const wchar_t* cardHeader(int page, int card) {
-    return nullptr;   // Buttons page identifies the selection via the pills; no card header needed
+    // Buttons page identifies the selection via the pills; no card header there.
+    switch (page) {
+    case 0: return card == 0 ? L"Momentum" : L"Direction & tilt";
+    case 1: return card == 0 ? L"Movement" : card == 1 ? L"Find the cursor" : L"Appearance";
+    case 3: return card == 0 ? L"Turbo" : L"Gestures";
+    case 4: return L"Startup";
+    }
+    return nullptr;
 }
 
 // Owner-draw BUTTONs erase to the default (light) background for one frame before
@@ -1331,12 +1540,12 @@ static HWND makeOwnerBtn(HWND parent, int id, int x, int y, int w, int h) {
 // Create one control for a row + record its UiRow. Geometry is derived from `kind`
 // so both the static pages and the dynamic Buttons page stay pixel-consistent.
 //   kind: 0 toggle · 1 dropdown · 2 slider · 5 remove-button
-static void addRow(HWND hwnd, int page, int card, int kind, int id, const wchar_t* label, int rowTop) {
+static void addRow(HWND hwnd, int page, int card, int kind, int id, const wchar_t* label, int rowTop, const wchar_t* desc = L"") {
     HINSTANCE hi = GetModuleHandleW(nullptr);
-    const int right = P(WIN_W - 28), rowH = P(ROW_H);
+    const int right = P(WIN_W - 28) - P(20), rowH = P(ROW_H);   // inset controls from the card's right edge
     int cw = kind == 0 ? P(44) : kind == 1 ? P(194) : kind == 5 ? P(120) : P(250);
     int ch = kind == 0 ? P(26) : kind == 2 ? P(24) : P(28);
-    int cx = right - (kind == 0 ? P(46) : cw);
+    int cx = right - cw;
     int cy = rowTop + (rowH - ch) / 2;
     HWND c;
     if (kind == 2) {
@@ -1345,7 +1554,7 @@ static void addRow(HWND hwnd, int page, int card, int kind, int id, const wchar_
     } else {
         c = makeOwnerBtn(hwnd, id, cx, cy, cw, ch);
     }
-    g_rows.push_back({ page, card, kind, rowTop, rowH, cx, cy, ch, c, label });
+    g_rows.push_back({ page, card, kind, rowTop, rowH, cx, cy, ch, c, label, desc });
 }
 
 static std::wstring btnPillName(int b) {
@@ -1356,7 +1565,7 @@ static std::wstring btnPillName(int b) {
 static void BuildButtonsPage(HWND hwnd) {
     HINSTANCE hi = GetModuleHandleW(nullptr);
     const int left = P(SB_W + 28), right = P(WIN_W - 28), capH = P(58);
-    int y = P(60);
+    int y = P(76);
     HWND cap = CreateWindowW(L"SmoolyCapture", L"", WS_CHILD, left, y, right - left, capH,
                              hwnd, (HMENU)(INT_PTR)ID_CAPTURE, hi, nullptr);
     g_rows.push_back({ 2, -1, 4, y, capH, left, y, capH, cap, L"" });
@@ -1377,9 +1586,15 @@ static void BuildButtonsPage(HWND hwnd) {
     y += ph + P(22);
 
     static const wchar_t* trg[5] = { L"Click", L"Double-Click", L"Hold", L"Click + Scroll", L"Click + Drag" };
+    static const wchar_t* trgD[5] = {
+        L"Action when you press this button",
+        L"Action for two quick presses",
+        L"Action when you press and hold",
+        L"Hold the button, then spin the wheel",
+        L"Hold the button, then move the mouse" };
     int mi = g_selBtn;                                   // only the selected button's card
-    for (int tr = 0; tr < 5; tr++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 8 + tr, trg[tr], y); y += P(ROW_H); }
-    addRow(hwnd, 2, mi, 5, ID_DYN_REMOVE + mi, L"Remove this button", y);
+    for (int tr = 0; tr < 5; tr++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 8 + tr, trg[tr], y, trgD[tr]); y += P(ROW_H); }
+    addRow(hwnd, 2, mi, 5, ID_DYN_REMOVE + mi, L"Remove this button", y, L"Forget this mapping and restore default");
 }
 static void RebuildButtons(HWND hwnd) {
     for (auto it = g_rows.begin(); it != g_rows.end();) {
@@ -1390,27 +1605,46 @@ static void RebuildButtons(HWND hwnd) {
     ShowPage(g_page);
 }
 
+// About page: two cards. Card 1 (identity) holds a primary Donate button; card 2
+// (Support & links) holds Website / GitHub / Email as full-width list rows. The
+// static text (name, version, credit, contact, headers) is painted in drawAbout().
+static void BuildAboutPage(HWND hwnd) {
+    const int cardL = P(SB_W + 28), cardR = P(WIN_W - 28);
+    const int inL = cardL + P(26), inR = cardR - P(26);
+    HWND d = makeOwnerBtn(hwnd, ID_DONATE, inL, P(276), inR - inL, P(42));
+    g_rows.push_back({ PAGE_ABOUT, -3, 7, P(276), P(42), inL, P(276), P(42), d, L"♥  Donate", L"" });
+    struct { int id; const wchar_t* label; } sec[3] = { { ID_WEBSITE, L"Website" }, { ID_GITHUB, L"GitHub" }, { ID_EMAIL, L"Email" } };
+    int y = P(368), h = P(52);                 // flat, contiguous list rows (dividers drawn per-row)
+    for (int i = 0; i < 3; i++) {
+        HWND c = makeOwnerBtn(hwnd, sec[i].id, inL, y, inR - inL, h);
+        g_rows.push_back({ PAGE_ABOUT, -3, 7, y, h, inL, y, h, c, sec[i].label, L"" });
+        y += h;
+    }
+}
+
 static void BuildControls(HWND hwnd) {
-    struct Def { int page, card, kind, id; const wchar_t* label; };
+    struct Def { int page, card, kind, id; const wchar_t* label; const wchar_t* desc; };
     static const Def defs[] = {
-        { 0, 0, 0, ID_ENABLE,  L"Enable smooth scrolling" },
-        { 0, 0, 1, ID_SMOOTH,  L"Smoothness" },
-        { 0, 0, 1, ID_SPEED,   L"Speed" },
-        { 0, 0, 1, ID_ACCEL,   L"Acceleration" },
-        { 0, 1, 0, ID_REVERSE, L"Reverse scrolling" },
-        { 0, 1, 0, ID_HORIZ,   L"Smooth horizontal (tilt) wheel" },
-        { 0, 1, 0, ID_SHIFTH,  L"Shift + wheel scrolls horizontally" },
-        { 1, 0, 2, ID_PSPEED,  L"Pointer speed" },
-        { 1, 0, 0, ID_NOACCEL, L"Disable pointer acceleration" },
-        { 1, 1, 0, ID_SHAKE,   L"Shake to locate (grow cursor)" },
-        { 1, 2, 1, ID_THEME,   L"Cursor theme" },
-        { 1, 2, 1, ID_SIZE,    L"Cursor size" },
-        { 3, 0, 0, ID_CTRLT,   L"Ctrl + wheel = turbo scroll" },
-        { 3, 1, 0, ID_GESTURE, L"Click gestures (Alt = line, Alt+Shift = copy)" },
-        { 4, 0, 0, ID_STARTUP, L"Launch smooly when Windows starts" },
+        { 0, 0, 0, ID_ENABLE,  L"Enable smooth scrolling",            L"Add momentum and easing to the mouse wheel" },
+        { 0, 0, 1, ID_SMOOTH,  L"Smoothness",                         L"How long each notch keeps gliding" },
+        { 0, 0, 1, ID_SPEED,   L"Speed",                              L"Distance covered per wheel notch" },
+        { 0, 0, 1, ID_ACCEL,   L"Acceleration",                       L"Flick faster to scroll farther" },
+        { 0, 1, 0, ID_REVERSE, L"Reverse scrolling",                  L"Flip the direction (natural scrolling)" },
+        { 0, 1, 0, ID_HORIZ,   L"Smooth the tilt wheel",              L"Ease left / right scrolling on the tilt wheel" },
+        { 0, 1, 0, ID_SHIFTH,  L"Shift scrolls sideways",             L"Hold Shift and scroll to move horizontally" },
+        { 0, 1, 1, ID_HSPEED,  L"Horizontal speed",                   L"Sideways distance per notch" },
+        { 1, 0, 2, ID_PSPEED,  L"Pointer speed",                      L"Base cursor speed" },
+        { 1, 0, 0, ID_NOACCEL, L"Disable pointer acceleration",       L"Move the cursor 1:1 with your hand" },
+        { 1, 1, 0, ID_SHAKE,   L"Shake to locate",                    L"Briefly enlarge the cursor when you shake it" },
+        { 1, 2, 1, ID_THEME,   L"Cursor theme",                       L"Pick a cursor art style" },
+        { 1, 2, 1, ID_SIZE,    L"Cursor size",                        L"Overall cursor scale" },
+        { 3, 0, 0, ID_CTRLT,   L"Ctrl + wheel turbo",                 L"Hold Ctrl and scroll to move much faster" },
+        { 3, 1, 0, ID_GESTURE, L"Click gestures",                     L"Alt-click selects a line; Alt+Shift copies it" },
+        { 4, 0, 0, ID_STARTUP, L"Launch when Windows starts",         L"Run smooly automatically after you sign in" },
     };
+
     int py[kNumPages], lastCard[kNumPages];
-    for (int i = 0; i < kNumPages; i++) { py[i] = P(64); lastCard[i] = -1; }
+    for (int i = 0; i < kNumPages; i++) { py[i] = P(CONTENT_TOP); lastCard[i] = -1; }
 
     for (auto& d : defs) {
         int& y = py[d.page];
@@ -1420,10 +1654,11 @@ static void BuildControls(HWND hwnd) {
             y += P(8);
             lastCard[d.page] = d.card;
         }
-        addRow(hwnd, d.page, d.card, d.kind, d.id, d.label, y);
+        addRow(hwnd, d.page, d.card, d.kind, d.id, d.label, y, d.desc);
         y += P(ROW_H);
     }
     BuildButtonsPage(hwnd);
+    BuildAboutPage(hwnd);
     ShowPage(0);
 }
 
@@ -1444,15 +1679,29 @@ static RECT sidebarItem(int i) {
     return r;
 }
 static Gdiplus::Color gpc(COLORREF c) { return Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)); }
-static void fillRound(HDC dc, RECT rc, int rad, COLORREF col) {
-    Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+static void roundPath(Gdiplus::GraphicsPath& p, RECT rc, int rad) {
     float x = (float)rc.left, y = (float)rc.top, w = (float)(rc.right - rc.left), h = (float)(rc.bottom - rc.top);
     float d = rad * 2.0f; if (d > w) d = w; if (d > h) d = h;
-    Gdiplus::GraphicsPath p;
     p.AddArc(x, y, d, d, 180, 90); p.AddArc(x + w - d, y, d, d, 270, 90);
     p.AddArc(x + w - d, y + h - d, d, d, 0, 90); p.AddArc(x, y + h - d, d, d, 90, 90);
     p.CloseFigure();
+}
+static void fillRound(HDC dc, RECT rc, int rad, COLORREF col) {
+    Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::GraphicsPath p; roundPath(p, rc, rad);
     Gdiplus::SolidBrush b(gpc(col)); g.FillPath(&b, &p);
+}
+static void strokeRound(HDC dc, RECT rc, int rad, COLORREF col, float width) {
+    Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::GraphicsPath p; roundPath(p, rc, rad);
+    Gdiplus::Pen pen(gpc(col), width); g.DrawPath(&pen, &p);
+}
+static void fillRoundGrad(HDC dc, RECT rc, int rad, COLORREF top, COLORREF bot) {
+    Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::GraphicsPath p; roundPath(p, rc, rad);
+    Gdiplus::LinearGradientBrush b(Gdiplus::Rect(rc.left, rc.top - 1, rc.right - rc.left, rc.bottom - rc.top + 2),
+                                   gpc(top), gpc(bot), Gdiplus::LinearGradientModeVertical);
+    g.FillPath(&b, &p);
 }
 static void fillEllipse(HDC dc, int x, int y, int w, int h, COLORREF col) {
     Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -1534,7 +1783,7 @@ static void drawToggle(const DRAWITEMSTRUCT* d) {
 static void drawDropdown(const DRAWITEMSTRUCT* d) {
     HDC dc = d->hDC; RECT rc = d->rcItem;
     HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &rc, bg); DeleteObject(bg);
-    fillRound(dc, rc, P(12), C_LINE);
+    fillRound(dc, rc, P(12), C_CARD2); strokeRound(dc, rc, P(12), C_LINE, 1.0f);
     SetBkMode(dc, TRANSPARENT);
     std::wstring t = ddText(d->CtlID);
     RECT tr = rc; tr.left += P(12); tr.right -= P(28);
@@ -1548,7 +1797,7 @@ static void drawDropdown(const DRAWITEMSTRUCT* d) {
 static void drawRemove(const DRAWITEMSTRUCT* d) {
     HDC dc = d->hDC; RECT rc = d->rcItem;
     HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &rc, bg); DeleteObject(bg);
-    fillRound(dc, rc, P(12), C_LINE);
+    fillRound(dc, rc, P(12), C_CARD2); strokeRound(dc, rc, P(12), C_LINE, 1.0f);
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(0xe0, 0x6a, 0x6a));
     SelectObject(dc, g_font);
     DrawTextW(dc, L"Remove", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1562,6 +1811,35 @@ static void drawSelPill(const DRAWITEMSTRUCT* d) {   // Buttons-page selector ta
     SetBkMode(dc, TRANSPARENT); SelectObject(dc, g_font);
     SetTextColor(dc, sel ? RGB(255, 255, 255) : C_TEXT2);
     DrawTextW(dc, lbl.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+static const SvgIcon* linkIcon(int id) {
+    return id == ID_WEBSITE ? &kGlobeIcon : id == ID_GITHUB ? &kGithubIcon : id == ID_EMAIL ? &kMailIcon : nullptr;
+}
+static void drawLinkBtn(const DRAWITEMSTRUCT* d) {   // About-page action button
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &rc, bg); DeleteObject(bg);
+    std::wstring lbl; for (auto& r : g_rows) if (r.ctrl == d->hwndItem) { lbl = r.label; break; }
+    SetBkMode(dc, TRANSPARENT);
+    if (d->CtlID == ID_DONATE) {                       // primary gradient pill
+        fillRoundGrad(dc, rc, P(12), C_ACCENT2, C_ACCENT);
+        SelectObject(dc, g_font); SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, lbl.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        return;
+    }
+    // flat link row: top hairline separator · icon · label · chevron (no per-row card)
+    int cy = (rc.top + rc.bottom) / 2;
+    HPEN dv = CreatePen(PS_SOLID, 1, C_LINE); HGDIOBJ odv = SelectObject(dc, dv);
+    MoveToEx(dc, rc.left + P(2), rc.top, nullptr); LineTo(dc, rc.right - P(2), rc.top);
+    SelectObject(dc, odv); DeleteObject(dv);
+    if (const SvgIcon* ic = linkIcon(d->CtlID))
+        drawSvg(dc, rc.left + P(4), cy - P(10), P(20), C_TEXT, *ic, 1.7, d->CtlID == ID_GITHUB);
+    SelectObject(dc, g_font); SetTextColor(dc, C_TEXT);
+    RECT tr = rc; tr.left += P(38);
+    DrawTextW(dc, lbl.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, g_fontIcon); SetTextColor(dc, C_TEXT2);
+    RECT chr = rc; chr.right -= P(6);
+    wchar_t chev[2] = { 0xE76C, 0 };
+    DrawTextW(dc, chev, 1, &chr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 }
 // ---- custom dark dropdown popup ----
 static std::vector<std::wstring> g_popItems;
@@ -1638,11 +1916,13 @@ static void doDropdown(HWND hwnd, int id) {
             int mi = (id - ID_DYN_BASE) / 8, tr = (id - ID_DYN_BASE) % 8;
             if (idx == 7) {                                          // Keyboard shortcut -> capture combo
                 int combo = CaptureKeyCombo();
+                std::lock_guard<std::mutex> lock(g_mutex);           // hook thread reads g_maps
                 if (combo) { if (tr == 0) g_maps[mi].keyC = combo; else if (tr == 1) g_maps[mi].keyD = combo; else g_maps[mi].keyH = combo; }
                 else *d.val = 0;
             } else {                                                 // Type text -> prompt for a string
                 std::wstring cur = tr == 0 ? g_maps[mi].txtC : tr == 1 ? g_maps[mi].txtD : g_maps[mi].txtH;
                 std::wstring t = InputText(L"Type text", cur);
+                std::lock_guard<std::mutex> lock(g_mutex);           // hook thread reads g_maps
                 if (!t.empty()) { if (tr == 0) g_maps[mi].txtC = t; else if (tr == 1) g_maps[mi].txtD = t; else g_maps[mi].txtH = t; }
                 else *d.val = 0;
             }
@@ -1650,6 +1930,49 @@ static void doDropdown(HWND hwnd, int id) {
     }
     SaveConfig();
     InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
+}
+static void drawAbout(HDC dc, int cardL, int cardR) {
+    const int inL = cardL + P(26), inR = cardR - P(26);
+    SetBkMode(dc, TRANSPARENT);
+
+    // ---- identity card ----
+    RECT card1 = { cardL, P(96), cardR, P(328) };
+    fillRound(dc, card1, P(16), C_CARD); strokeRound(dc, card1, P(16), C_LINE, 1.0f);
+
+    RECT bd = { inL, P(122), inL + P(56), P(122) + P(56) }; fillRoundGrad(dc, bd, P(15), C_ACCENT2, C_ACCENT);
+    drawSvg(dc, bd.left + P(13), bd.top + P(13), P(30), RGB(255, 255, 255), kMouseIcon, 1.8, true);
+    int tx = bd.right + P(18);
+
+    SelectObject(dc, g_fontTitle); SetTextColor(dc, C_TEXT);
+    TextOutW(dc, tx, P(128), L"smooly", 6);
+    SIZE nm; GetTextExtentPoint32W(dc, L"smooly", 6, &nm);
+    SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
+    TextOutW(dc, tx + nm.cx + P(10), P(136), L"v" APP_VERSION, lstrlenW(L"v" APP_VERSION));
+    SelectObject(dc, g_font); SetTextColor(dc, C_TEXT2);
+    const wchar_t* tag = L"Make any mouse feel premium on Windows.";
+    TextOutW(dc, tx, P(154), tag, lstrlenW(tag));
+
+    HPEN line = CreatePen(PS_SOLID, 1, C_LINE); HGDIOBJ op = SelectObject(dc, line);
+    MoveToEx(dc, inL, P(200), nullptr); LineTo(dc, inR, P(200)); SelectObject(dc, op); DeleteObject(line);
+
+    // "Made with ♥ by Nischal Dahal" — the heart in red.
+    SelectObject(dc, g_font);
+    const wchar_t* a = L"Made with "; const wchar_t* b = L"♥"; const wchar_t* c = L" by Nischal Dahal";
+    SIZE s1, s2; GetTextExtentPoint32W(dc, a, lstrlenW(a), &s1); GetTextExtentPoint32W(dc, b, 1, &s2);
+    int ly = P(220);
+    SetTextColor(dc, C_TEXT);                TextOutW(dc, inL, ly, a, lstrlenW(a));
+    SetTextColor(dc, RGB(0xff, 0x5a, 0x5f)); TextOutW(dc, inL + s1.cx, ly, b, 1);
+    SetTextColor(dc, C_TEXT);                TextOutW(dc, inL + s1.cx + s2.cx, ly, c, lstrlenW(c));
+
+    SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
+    std::wstring em = std::wstring(L"Contact  ") + CONTACT_EMAIL;
+    TextOutW(dc, inL, P(246), em.c_str(), (int)em.size());
+    // Donate button is a child control drawn over this card.
+
+    // ---- support & links (flat list, not a card) ----
+    SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
+    TextOutW(dc, cardL + P(6), P(346), L"Support & links", 15);
+    // Website / GitHub / Email are flat child rows; each draws its own top hairline.
 }
 static void PaintWindow(HWND hwnd, HDC hdc) {
     RECT cr; GetClientRect(hwnd, &cr);
@@ -1661,32 +1984,53 @@ static void PaintWindow(HWND hwnd, HDC hdc) {
     FillRect(dc, &cr, g_brBg);
     RECT sb = { 0, 0, P(SB_W), cr.bottom }; FillRect(dc, &sb, g_brSide);
 
+    // wordmark: app badge + "smooly", with a hairline divider under it
+    { RECT bd = { P(18), P(16), P(18) + P(30), P(16) + P(30) }; fillRoundGrad(dc, bd, P(9), C_ACCENT2, C_ACCENT);
+      drawSvg(dc, bd.left + P(6), bd.top + P(6), P(18), RGB(255, 255, 255), kMouseIcon, 1.7, true); }
     SelectObject(dc, g_fontTitle); SetTextColor(dc, C_TEXT);
-    TextOutW(dc, P(20), P(18), L"smooly", 6);
+    TextOutW(dc, P(56), P(20), L"smooly", 6);
+    { HPEN ln = CreatePen(PS_SOLID, 1, C_LINE); HGDIOBJ o = SelectObject(dc, ln);
+      MoveToEx(dc, P(18), P(54), nullptr); LineTo(dc, P(SB_W - 14), P(54)); SelectObject(dc, o); DeleteObject(ln); }
 
     for (int i = 0; i < kNumPages; i++) {
         RECT ir = sidebarItem(i);
-        if (i == g_page)            fillRound(dc, ir, P(10), C_ACCENT);
-        else if (i == g_hoverItem)  fillRound(dc, ir, P(10), C_HOVER);
         bool sel = (i == g_page);
+        if (sel)                    fillRound(dc, ir, P(10), C_SELBG);
+        else if (i == g_hoverItem)  fillRound(dc, ir, P(10), C_HOVER);
+        if (sel) { RECT bar = { ir.left + P(4), ir.top + P(10), ir.left + P(7), ir.bottom - P(10) }; fillRound(dc, bar, P(2), C_ACCENT); }
         int iy = ir.top + (ir.bottom - ir.top - P(20)) / 2;
-        drawSvg(dc, ir.left + P(14), iy, P(20), sel ? RGB(255, 255, 255) : C_TEXT2, kIcons[i], 1.6, true);
-        RECT tr = { ir.left + P(46), ir.top, ir.right, ir.bottom };
-        SelectObject(dc, g_font); SetTextColor(dc, sel ? RGB(255, 255, 255) : C_TEXT);
+        drawSvg(dc, ir.left + P(18), iy, P(20), sel ? C_ACCENT : C_TEXT2, kIcons[i], 1.7, true);
+        RECT tr = { ir.left + P(48), ir.top, ir.right, ir.bottom };
+        SelectObject(dc, g_font); SetTextColor(dc, sel ? C_TEXT : C_TEXT2);
         DrawTextW(dc, kPageNames[i], -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
+    // sidebar footer: version tag
+    SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
+    TextOutW(dc, P(20), P(WIN_H - 34), L"v" APP_VERSION, lstrlenW(L"v" APP_VERSION));
+
     SelectObject(dc, g_fontTitle); SetTextColor(dc, C_TEXT);
-    TextOutW(dc, P(SB_W + 28), P(22), kPageNames[g_page], lstrlenW(kPageNames[g_page]));
+    TextOutW(dc, P(SB_W + 28), P(20), kPageNames[g_page], lstrlenW(kPageNames[g_page]));
+    SelectObject(dc, g_font); SetTextColor(dc, C_TEXT2);
+    TextOutW(dc, P(SB_W + 28), P(47), kPageSubs[g_page], lstrlenW(kPageSubs[g_page]));
 
     int cardL = P(SB_W + 28), cardR = P(WIN_W - 28);
+    if (g_page == PAGE_ABOUT) {
+        drawAbout(dc, cardL, cardR);
+        SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
+        RECT af = { cardL, cr.bottom - P(28), cardR, cr.bottom - P(8) };
+        DrawTextW(dc, L"Closing this window keeps smooly running in the tray.", -1, &af, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        BitBlt(hdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, ob); DeleteObject(bmp); DeleteDC(dc);
+        return;
+    }
     auto isRow = [](const UiRow& r) { return r.kind != 4 && r.kind != 6; };   // capture/selector are standalone
     auto drawCard = [&](int card, int top, int bot) {
         if (const wchar_t* hdr = cardHeader(g_page, card)) {
             SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
             TextOutW(dc, cardL + P(4), top - P(20), hdr, lstrlenW(hdr));
         }
-        RECT c = { cardL, top, cardR, bot }; fillRound(dc, c, P(14), C_CARD);
+        RECT c = { cardL, top, cardR, bot }; fillRound(dc, c, P(14), C_CARD); strokeRound(dc, c, P(14), C_LINE, 1.0f);
     };
     int curCard = -999, top = 0, bot = 0;
     for (auto& r : g_rows) if (r.page == g_page && isRow(r)) {
@@ -1701,14 +2045,24 @@ static void PaintWindow(HWND hwnd, HDC hdc) {
         int ly = r.top;
         if (r.card == curCard) {
             HGDIOBJ op = SelectObject(dc, line);
-            MoveToEx(dc, cardL + P(18), ly, nullptr); LineTo(dc, cardR - P(14), ly);
+            MoveToEx(dc, cardL + P(20), ly, nullptr); LineTo(dc, cardR - P(16), ly);
             SelectObject(dc, op);
         }
         curCard = r.card;
         int ctlW = r.kind == 0 ? P(46) : r.kind == 1 ? P(194) : r.kind == 5 ? P(120) : P(250);
-        RECT lr = { cardL + P(18), ly, cardR - ctlW - P(12), ly + r.h };
-        SelectObject(dc, g_font); SetTextColor(dc, C_TEXT);
-        DrawTextW(dc, r.label.c_str(), -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        int lx = cardL + P(20), lrR = cardR - ctlW - P(32);
+        if (!r.desc.empty()) {
+            RECT l1 = { lx, ly + P(10), lrR, ly + P(30) };
+            SelectObject(dc, g_font); SetTextColor(dc, C_TEXT);
+            DrawTextW(dc, r.label.c_str(), -1, &l1, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            RECT l2 = { lx, ly + P(30), lrR, ly + P(48) };
+            SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
+            DrawTextW(dc, r.desc.c_str(), -1, &l2, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        } else {
+            RECT lr = { lx, ly, lrR, ly + r.h };
+            SelectObject(dc, g_font); SetTextColor(dc, C_TEXT);
+            DrawTextW(dc, r.label.c_str(), -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
     }
     DeleteObject(line);
 
@@ -1739,7 +2093,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DRAWITEM: {
         const DRAWITEMSTRUCT* di = (const DRAWITEMSTRUCT*)lParam;
         for (auto& r : g_rows) if (r.ctrl == di->hwndItem) {
-            if (r.kind == 0) drawToggle(di); else if (r.kind == 1) drawDropdown(di); else if (r.kind == 5) drawRemove(di); else if (r.kind == 6) drawSelPill(di);
+            if (r.kind == 0) drawToggle(di); else if (r.kind == 1) drawDropdown(di); else if (r.kind == 5) drawRemove(di); else if (r.kind == 6) drawSelPill(di); else if (r.kind == 7) drawLinkBtn(di);
             return TRUE;
         }
         return TRUE;
@@ -1773,8 +2127,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if ((HWND)lParam == GetDlgItem(hwnd, ID_PSPEED)) {
             int pos = HIWORD(wParam);
             { std::lock_guard<std::mutex> lock(g_mutex); g_cfg.pointerSpeed = pos; }
-            ApplyPointerSpeed(pos);
-            SaveConfig();
+            ApplyPointerSpeed(pos);                     // live preview while dragging
+            if (LOWORD(wParam) == SB_THUMBPOSITION) SaveConfig();   // persist once, on release
         }
         return 0;
 
@@ -1784,6 +2138,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (id == IDM_QUIT)   { DestroyWindow(hwnd); return 0; }
         if (id == IDM_TOGGLE) { { std::lock_guard<std::mutex> lock(g_mutex); g_cfg.enabled = !g_cfg.enabled; } SaveConfig(); InvalidateRect(GetDlgItem(hwnd, ID_ENABLE), nullptr, TRUE); return 0; }
         if (code != BN_CLICKED) return 0;
+        if (id == ID_DONATE)  { ShellExecuteW(hwnd, L"open", URL_DONATE,  nullptr, nullptr, SW_SHOWNORMAL); return 0; }
+        if (id == ID_WEBSITE) { ShellExecuteW(hwnd, L"open", URL_WEBSITE, nullptr, nullptr, SW_SHOWNORMAL); return 0; }
+        if (id == ID_GITHUB)  { ShellExecuteW(hwnd, L"open", URL_GITHUB,  nullptr, nullptr, SW_SHOWNORMAL); return 0; }
+        if (id == ID_EMAIL)   { ShellExecuteW(hwnd, L"open", (std::wstring(L"mailto:") + CONTACT_EMAIL).c_str(), nullptr, nullptr, SW_SHOWNORMAL); return 0; }
         if (id >= ID_SEL_BASE && id < ID_SEL_BASE + 100) {       // pick which button to show
             int mi = id - ID_SEL_BASE;
             if (mi >= 0 && mi < (int)g_maps.size() && mi != g_selBtn) { g_selBtn = mi; RebuildButtons(hwnd); }
@@ -1791,7 +2149,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (id >= ID_DYN_REMOVE && id < ID_DYN_REMOVE + 100) {   // remove a registered button
             int mi = id - ID_DYN_REMOVE;
-            if (mi >= 0 && mi < (int)g_maps.size()) { g_maps.erase(g_maps.begin() + mi); if (g_selBtn >= (int)g_maps.size()) g_selBtn = (int)g_maps.size() - 1; RebuildButtons(hwnd); SaveConfig(); }
+            if (mi >= 0 && mi < (int)g_maps.size()) {
+                { std::lock_guard<std::mutex> lock(g_mutex); g_maps.erase(g_maps.begin() + mi); }   // hook thread reads g_maps
+                if (g_selBtn >= (int)g_maps.size()) g_selBtn = (int)g_maps.size() - 1;
+                RebuildButtons(hwnd); SaveConfig();
+            }
             return 0;
         }
         if (int* v = toggleCfg(id)) {
@@ -1810,7 +2172,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int btn = (int)wParam;
         if (btn == 3 || btn == 4 || btn == 5) {
             bool ex = false; for (auto& m : g_maps) if (m.button == btn) { ex = true; break; }
-            if (!ex) { g_maps.push_back(BtnMap{ btn }); g_selBtn = (int)g_maps.size() - 1; RebuildButtons(hwnd); SaveConfig(); }
+            if (!ex) {
+                { std::lock_guard<std::mutex> lock(g_mutex); g_maps.push_back(BtnMap{ btn }); }     // hook thread reads g_maps
+                g_selBtn = (int)g_maps.size() - 1; RebuildButtons(hwnd); SaveConfig();
+            }
         }
         return 0;
     }
@@ -1867,9 +2232,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     const wchar_t* bodyFace  = loaded > 0 ? L"Inter Medium"   : L"Segoe UI";
     const wchar_t* titleFace = loaded > 0 ? L"Inter SemiBold" : L"Segoe UI Semibold";
     const wchar_t* smallFace = loaded > 0 ? L"Inter"          : L"Segoe UI";
+    // NOTE: the whole window paints into an offscreen memory DC and is then BitBlt'd.
+    // ClearType (subpixel) renders WRONG on a memory DC — it can't blend against the real
+    // background, so text comes out muddy/fringed. Grayscale ANTIALIASED_QUALITY blends
+    // correctly against the pixels we already drew, giving clean, crisp text everywhere.
     auto mkFont = [&](int pt, int weight, const wchar_t* f) {
         return CreateFontW(-MulDiv(pt, g_dpi, 72), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, f);
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, f);
     };
     g_font      = mkFont(10, FW_NORMAL, bodyFace);
     g_fontTitle = mkFont(15, FW_NORMAL, titleFace);
@@ -1941,23 +2310,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ShowWindow(g_wnd, SW_SHOW);
     UpdateWindow(g_wnd);
 
-    g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, hInst, 0);
+    g_wake      = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-reset anim wake
+    g_hookReady = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    std::thread hookTh(HookThread, hInst);       // input on its own time-critical pump
+    WaitForSingleObject(g_hookReady, 3000);
     if (!g_hook) {
         MessageBoxW(g_wnd, L"Failed to install the mouse hook.", L"smooly", MB_ICONERROR);
+        hookTh.join();
         return 1;
     }
 
     std::thread anim(AnimationLoop);
 
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {   // this thread pumps -> the LL hook fires here
+    while (GetMessageW(&msg, nullptr, 0, 0)) {   // GUI only — input runs on HookThread
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
     g_running.store(false);
+    SetEvent(g_wake);                            // unpark the anim thread so it can exit
+    PostThreadMessageW(g_hookTid, WM_QUIT, 0, 0);
     anim.join();
-    UnhookWindowsHookEx(g_hook);
+    hookTh.join();
     Gdiplus::GdiplusShutdown(g_gdiplus);
     return 0;
 }

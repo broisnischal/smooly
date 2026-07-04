@@ -10,6 +10,7 @@ struct Config {
     int reverse      = 0;   // natural (reversed) vertical direction
     int horizontal   = 1;   // smooth the horizontal (tilt) wheel too
     int shiftHoriz   = 1;   // Shift + vertical wheel scrolls horizontally
+    int hspeed       = 1;   // horizontal scroll speed: 0=Slow 1=Medium 2=Fast
     int ctrlTurbo    = 0;   // Ctrl + wheel = turbo scroll (overrides Ctrl+zoom while on)
     int gestures     = 0;   // Shift/Alt/Alt+Shift + click selection gestures
     int shake        = 1;   // shake the mouse to locate: cursor grows big
@@ -66,19 +67,21 @@ static const int    kShakeHoldMs       = 900;   // stay big this long after the 
 static const double kShakeGrowRate     = 22.0;  // ease-in speed of the zoom (per second)
 static const double kShakeShrinkRate   = 15.0;  // ease-out speed back to normal (per second)
 
-// Ease rate (per second) at which the owed scroll distance is paid out. Higher =
-// snappier arrival; lower = longer, silkier glide. Index 0 (Off) is a passthrough.
+// Scroll-gesture duration (ms) per smoothness level. Every notch re-plans a
+// cubic ease that pays out the whole owed distance over this window and lands
+// at exactly zero velocity — so a scroll can neither creep at the tail nor stop
+// on a cliff. New notches restart the window and carry the current velocity, so
+// sustained scrolling reads as one continuous glide. Index 0 (Off) = passthrough.
 //   0 Off · 1 Low · 2 Medium · 3 High · 4 Very High · 5 Buttery
-static const double kRateBySmoothness[6] = { 0.0, 25.0, 18.0, 13.0, 9.5, 7.0 };
-
-// The owed distance always clears at >= this speed (units/sec). This caps the
-// tail so a scroll never creeps before stopping. It mainly affects SHORT scrolls
-// (a notch or two) — keeping them crisp instead of floaty — while long flings are
-// dominated by the eased head and stay smooth.
-static const double kMinScrollSpeed = 620.0;
+static const double kDurBySmoothness[6] = { 0.0, 110.0, 160.0, 220.0, 300.0, 400.0 };
 
 // Base scroll distance per physical notch (a native notch is 120 units).
 static const double kStepBySpeed[3] = { 90.0, 150.0, 240.0 };
+
+// Horizontal scroll speed multiplier (tilt wheel + Shift+wheel). Horizontal tends
+// to feel slow, so even "Slow" is 1:1 and the default steps it up.
+static const wchar_t* const kHSpeedNames[3] = { L"Slow", L"Medium", L"Fast" };
+static const double         kHSpeedMul[3]   = { 1.0, 1.8, 3.0 };
 
 // Acceleration builds with *sustained* fast scrolling rather than reacting to a
 // single notch, so a short quick flick no longer overshoots. A per-axis counter
