@@ -1,5 +1,7 @@
 # build output
 smooly.exe
+btnprobe.exe
+tools/png2cur.exe
 app_res.o
 *.o
 *.obj
