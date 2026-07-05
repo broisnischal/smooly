@@ -30,26 +30,47 @@ struct BtnMap {
     int click = 0, dbl = 0, hold = 0, scroll = 0, drag = 0;
     int keyC = 0, keyD = 0, keyH = 0;                // captured combo when action = Keyboard shortcut
     std::wstring txtC, txtD, txtH;                   // text to type when action = Type text
+    int gU = 0, gD = 0, gL = 0, gR = 0;              // gesture direction actions (when drag = Gesture)
 };
 
 // Actions for Click / Double-Click / Hold.  7 captures a key combo, 8 types a string.
-//   0 Default · 1 Middle · 2 Copy · 3 Paste · 4 Back · 5 Forward · 6 Disabled · 7 Keyboard shortcut · 8 Type text
+//   0 Default (keep native) · 1 Middle · 2 Copy · 3 Paste · 4 Back · 5 Forward · 6 None (do nothing) · 7 Keyboard shortcut · 8 Type text
 static const wchar_t* const kButtonActions[9] = {
-    L"Default", L"Middle click", L"Copy", L"Paste", L"Back", L"Forward", L"Disabled", L"Keyboard shortcut", L"Type text"
+    L"Default", L"Middle click", L"Copy", L"Paste", L"Back", L"Forward", L"None", L"Keyboard shortcut", L"Type text"
 };
 // Action while the button is held and the wheel is turned (Click and Scroll).
 //   0 None · 1 Horizontal scroll · 2 Zoom (Ctrl+wheel) · 3 Fast (swift) scroll
 static const wchar_t* const kScrollActions[4] = { L"None", L"Horizontal scroll", L"Zoom", L"Fast scroll" };
 // Action while the button is held and the mouse is dragged (Click and Drag).
-//   0 None · 1 Scroll (drag to pan) · 2 Switch desktop · 3 Task View
-static const wchar_t* const kDragActions[4] = { L"None", L"Scroll (drag to pan)", L"Switch desktop", L"Task View" };
+//   0 None · 1 Scroll (pan) · 2 Grab · 3 Switch desktop · 4 Task View · 5 Navigate · 6 Precision · 7 Gesture
+static const wchar_t* const kDragActions[8] = { L"None", L"Scroll (drag to pan)", L"Grab (hand pan)", L"Switch desktop", L"Task View", L"Navigate (back/forward)", L"Precision (slow pointer)", L"Gesture (flick)" };
+
+// Actions a gesture direction (Up/Down/Left/Right) can trigger. A curated system
+// set — no per-direction key capture needed (keeps the UI simple).
+static const wchar_t* const kGestureActions[] = {
+    L"None", L"Back", L"Forward", L"Desktop left", L"Desktop right", L"Task View",
+    L"Show desktop", L"Next track", L"Previous track", L"Play / Pause",
+    L"Volume up", L"Volume down", L"Copy", L"Paste", L"Middle click"
+};
+static const int kNumGestureActions = 15;
+
+static const int    kGestureMinPx   = 24;    // min net travel (px) for a flick to register
+static const double kPrecisionFactor = 0.35; // OS pointer speed multiplier while a Precision button is held
 
 static const int kHoldMs   = 220;   // press longer than this = Hold gesture
 static const int kDblMs    = 260;   // second click within this = Double-Click
 static const int kDragPx     = 6;   // movement past this while held = a drag
 static const int kDeskPx     = 180; // horizontal drag per desktop switch
+static const int kNavPx      = 120; // horizontal drag per back/forward navigation
 static const int kSwiftMul   = 4;   // Fast (swift) scroll distance multiplier
-static const int kDragScroll = 3;   // drag-to-pan sensitivity (wheel delta per pixel)
+
+// Drag-to-scroll (pan/grab) feel — routes through the smooth engine, MMF-style.
+static const double kDragPanUnits  = 2.2;   // wheel units emitted per pixel of drag (~content vs hand speed)
+static const double kDragGlideMs   = 16.0;  // SHORT glide while dragging — tight tracking, no lag balloon
+static const double kInertiaMs     = 650.0; // coast duration after release (momentum)
+static const double kInertiaMinVel = 1.2;   // min release speed (units/ms) to start a coast
+static const double kInertiaCap    = 4000.0;// max coast distance (wheel units)
+static const int    kTouchpadWindowMs = 150; // after touchpad activity, pass wheel through untouched this long
 
 // Cursor sizes. Regular/Large/Extra-Large are bundled folders; "Small" has no
 // folder and is produced by runtime-downscaling. kSizeScale is the scale applied

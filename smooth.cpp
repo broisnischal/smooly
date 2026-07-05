@@ -106,6 +106,8 @@ static std::atomic<bool>     g_pHoldFired{false};
 static std::atomic<bool>     g_pScrolled{false};
 static std::atomic<int>      g_pHoldAction{0}; // hold action of the active press
 static std::atomic<int>      g_pHoldCombo{0};  // hold key-combo (if hold action = shortcut)
+static std::atomic<int>      g_holdHeldBtn{0}; // mouse button (1 mid/4 back/5 fwd) held DOWN by a Hold gesture
+static std::atomic<LONGLONG> g_touchpadUntil{0}; // pass wheel through untouched until this QPC tick (recent touchpad use)
 static std::wstring          g_pHoldText;      // hold text (guarded by g_mutex)
 static std::atomic<int>      g_pDragAction{0}; // drag action of the active press
 static std::atomic<bool>     g_pDragged{false};
@@ -113,10 +115,25 @@ static std::atomic<int>      g_pendAction{0};  // deferred single-click action
 static std::atomic<int>      g_pendCombo{0};
 static std::wstring          g_pendText;       // deferred single-click text (guarded)
 static std::atomic<LONGLONG> g_pendDeadline{0};
-static std::atomic<int>      g_panV{0}, g_panH{0};   // queued drag-pan wheel
-static std::atomic<int>      g_dragCmd{0};     // 1 desktop-left · 2 desktop-right · 3 Task View
+static std::atomic<int>      g_dragCmd{0};     // 1 desktop-left · 2 desktop-right · 3 Task View · 4 Back · 5 Forward
+static std::atomic<bool>     g_grabWant{false};    // hook: a Grab (hand-pan) drag is active
+static std::atomic<bool>     g_grabApplied{false}; // anim: the hand cursor is currently installed
+static void ApplyGrabCursor();     // install a Figma-style grab hand as every cursor (anim thread)
+static void ReleaseGrabCursor();   // restore the theme cursors when the grab ends
 static int      g_lastClickBtn = 0; static LONGLONG g_lastClickAt = 0;   // double-click (hook only)
 static LONG     g_dragLastX = 0, g_dragLastY = 0; static int g_dragTotal = 0, g_dragAccX = 0;  // drag (hook only)
+static LONGLONG g_dragLastT = 0; static double g_dragVX = 0, g_dragVY = 0;  // drag velocity for inertia (hook only, units/ms)
+static LONG     g_gestDx = 0, g_gestDy = 0;         // gesture net displacement while a Gesture button is held (hook only)
+static std::atomic<int> g_gestCmd{0};              // queued gesture action index for the anim thread to perform
+static int      g_precSaved = 0;                    // OS pointer speed saved while a Precision button is held (0 = not engaged)
+// Copy-on-select: hold the C key and drag-select with the left button -> auto Ctrl+C on release.
+static std::atomic<bool>      g_cHeld{false};       // physical C key currently held (set by the keyboard hook)
+static bool                   g_cCopyArmed = false; // a C+left-drag is in progress (hook thread only)
+static bool                   g_cCopyDragged = false;
+static std::atomic<bool>      g_cModifierActive{false}; // C is acting as the copy modifier -> suppress 'c' until released
+static LONG                   g_cDownX = 0, g_cDownY = 0;
+static std::atomic<ULONGLONG> g_copyDeadline{0};    // GetTickCount64() at which to fire the deferred Ctrl+C (0 = none)
+static HHOOK    g_kbHook     = nullptr;             // persistent low-level keyboard hook (C-key tracking)
 static HHOOK    g_keyCapHook = nullptr;
 static std::atomic<int> g_capturedKey{-1};     // -1 capturing · 0 cancel · else packed combo
 
@@ -142,18 +159,21 @@ static int                g_origMouse[3] = { 6, 10, 1 };  // saved accel params 
 static ULONG_PTR          g_gdiplus = 0;       // GDI+ token (high-quality cursor scaling)
 
 // near-black premium palette (SQL-Studio-style) + violet accent
-static const COLORREF C_SIDE   = RGB(0x0b, 0x0b, 0x0d);
-static const COLORREF C_BG     = RGB(0x0f, 0x0f, 0x12);
-static const COLORREF C_CARD   = RGB(0x18, 0x18, 0x1e);
-static const COLORREF C_CARD2  = RGB(0x1f, 0x1f, 0x27);   // inset control fill (dropdowns)
-static const COLORREF C_LINE   = RGB(0x2a, 0x2a, 0x32);   // card / control borders
-static const COLORREF C_HOVER  = RGB(0x1e, 0x1e, 0x23);
-static const COLORREF C_TEXT   = RGB(0xf4, 0xf4, 0xf7);
-static const COLORREF C_TEXT2  = RGB(0x87, 0x87, 0x92);
-static const COLORREF C_ACCENT = RGB(0x8b, 0x5c, 0xf6);   // violet-500 primary
-static const COLORREF C_ACCENT2= RGB(0xa7, 0x8c, 0xfa);   // violet-400 (gradient top)
-static const COLORREF C_SELBG  = RGB(0x21, 0x1c, 0x38);   // selected sidebar tint (violet)
-static const COLORREF C_KNOB   = RGB(0x3a, 0x3a, 0x42);
+// Conduish-style palette: flat near-black, subtle borders, monochrome chrome.
+// Colour is semantic only — green = active/on, red = destructive.
+static const COLORREF C_SIDE   = RGB(0x0b, 0x0b, 0x0b);   // sidebar (near-black)
+static const COLORREF C_BG     = RGB(0x0e, 0x0e, 0x0e);   // content (near-black)
+static const COLORREF C_CARD   = RGB(0x15, 0x15, 0x15);   // cards / panels
+static const COLORREF C_CARD2  = RGB(0x1c, 0x1c, 0x1c);   // inset control fill (inputs/dropdowns/buttons)
+static const COLORREF C_LINE   = RGB(0x2a, 0x2a, 0x2a);   // hairline borders
+static const COLORREF C_HOVER  = RGB(0x1a, 0x1a, 0x1a);   // row hover
+static const COLORREF C_TEXT   = RGB(0xed, 0xed, 0xed);   // primary text
+static const COLORREF C_TEXT2  = RGB(0x8a, 0x8a, 0x8a);   // secondary text
+static const COLORREF C_ACCENT = RGB(0xed, 0xed, 0xed);   // active / on / fill (monochrome white)
+static const COLORREF C_ACCENT2= RGB(0xff, 0xff, 0xff);   // (reserved)
+static const COLORREF C_SELBG  = RGB(0x24, 0x24, 0x24);   // selected item (neutral gray fill)
+static const COLORREF C_KNOB   = RGB(0x33, 0x33, 0x33);   // toggle off track
+static const COLORREF C_DANGER = RGB(0xf8, 0x51, 0x49);   // destructive (Remove / Reset)
 static HBRUSH g_brSide = nullptr, g_brBg = nullptr;
 
 // declarative rows -> lets WM_PAINT draw cards + labels from stored geometry.
@@ -183,6 +203,10 @@ static const char* IC_GEN[] = {
 static const char* IC_HEART[] = {
     "M12.62 20.81c-.34.12-.9.12-1.24 0C8.48 19.82 2 15.69 2 8.69C2 5.6 4.49 3.1 7.56 3.1c1.82 0 3.43.88 4.44 2.24c1.01-1.36 2.62-2.24 4.44-2.24C19.51 3.1 22 5.6 22 8.69c0 7-6.48 11.13-9.38 12.12Z" };
 
+// Grab / pan hand (Material "pan_tool", 24x24, single filled path) — the grab cursor.
+static const char* IC_HANDGRAB[] = {
+    "M23 5.5V20c0 2.2-1.8 4-4 4h-7.3c-1.08 0-2.1-.43-2.85-1.19L1 14.83s1.26-1.23 1.3-1.25c.22-.19.49-.29.79-.29c.22 0 .42.06.6.16c.04.01 4.31 2.46 4.31 2.46V4c0-.83.67-1.5 1.5-1.5S11 3.17 11 4v7h1V1.5c0-.83.67-1.5 1.5-1.5S15 .67 15 1.5V11h1V2.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5V11h1V5.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5z" };
+
 // About-page link-row icons (stroke, 24x24 viewBox).
 static const char* IC_GLOBE[] = {
     "M2.5 12a9.5 9.5 0 1 0 19 0a9.5 9.5 0 1 0-19 0Z",
@@ -197,10 +221,38 @@ static const char* IC_UPDATE[] = {
     "M3 12a9 9 0 0 1 15.5-6.2L21 8M21 3v5h-5",
     "M21 12a9 9 0 0 1-15.5 6.2L3 16m0 5v-5h5" };
 
+// --- HugeIcons "Mouse Icons" pack (Figma Community / hugeicons, CC BY 4.0) -----
+// UI glyphs (NOT cursors) — same source + 24x24 viewBox as the icons above, so they
+// render through the same svgBuild path system. Used on the Buttons page.
+static const char* IC_MOUSE_DEVICE[] = {   // hugeicons mouse-08: detailed mouse
+    "M7.192 18.071c.152 1.913 1.667 3.538 3.62 3.778c.718.089 1.448.151 2.188.151s1.47-.062 2.188-.15c1.953-.241 3.467-1.866 3.62-3.779c.105-1.326.192-2.685.192-4.071s-.087-2.745-.193-4.071c-.151-1.913-1.666-3.538-3.62-3.778A18 18 0 0 0 13 6c-.74 0-1.47.062-2.188.15c-1.953.241-3.468 1.866-3.62 3.779C7.087 11.255 7 12.614 7 14s.087 2.745.192 4.071Z",
+    "M13 9V7.5c0-1.886 0-2.828-.586-3.414S10.886 3.5 9 3.5H6.5A1.5 1.5 0 0 1 5 2",
+    "M11.5 10.5c0-.466 0-.699.076-.883a1 1 0 0 1 .541-.54C12.301 9 12.534 9 13 9s.699 0 .883.076a1 1 0 0 1 .54.541c.077.184.077.417.077.883v1c0 .466 0 .699-.076.883a1 1 0 0 1-.541.54C13.699 13 13.466 13 13 13s-.699 0-.883-.076a1 1 0 0 1-.54-.541c-.077-.184-.077-.417-.077-.883z" };
+static const char* IC_MOUSE_LEFT[] = {     // hugeicons mouse-left-click-01
+    "M13.5 2v4m0 4v2",
+    "M5 2C3.945 3.132 3.235 4.501 3 6",
+    "M12 7.5c0-.466 0-.699.076-.883a1 1 0 0 1 .541-.54C12.801 6 13.034 6 13.5 6s.699 0 .883.076a1 1 0 0 1 .54.541c.077.184.077.417.077.883v1c0 .466 0 .699-.076.883a1 1 0 0 1-.541.54c-.184.077-.417.077-.883.077s-.699 0-.883-.076a1 1 0 0 1-.54-.541C12 9.199 12 8.966 12 8.5z",
+    "M6.24 17.089c.19 2.391 2.084 4.422 4.525 4.723c.898.11 1.81.188 2.735.188s1.837-.078 2.735-.188c2.44-.301 4.334-2.332 4.524-4.723c.132-1.657.241-3.357.241-5.089s-.11-3.432-.24-5.089c-.19-2.391-2.084-4.422-4.525-4.723C15.337 2.078 14.425 2 13.5 2s-1.837.078-2.735.188c-2.44.3-4.335 2.332-4.524 4.723C6.109 8.568 6 10.268 6 12s.109 3.432.24 5.089Z" };
+static const char* IC_MOUSE_RIGHT[] = {    // hugeicons mouse-right-click-01
+    "M10.5 2v4m0 4v2",
+    "M3.24 17.089c.19 2.391 2.084 4.422 4.525 4.723c.898.11 1.81.188 2.735.188s1.837-.078 2.735-.188c2.44-.301 4.334-2.332 4.524-4.723c.132-1.657.241-3.357.241-5.089s-.11-3.432-.24-5.089c-.19-2.391-2.084-4.422-4.525-4.723C12.337 2.078 11.425 2 10.5 2s-1.837.078-2.735.188c-2.44.3-4.335 2.332-4.524 4.723C3.109 8.568 3 10.268 3 12s.109 3.432.24 5.089Z",
+    "M19 2c1.055 1.132 1.765 2.501 2 4",
+    "M12 7.5c0-.466 0-.699-.076-.883a1 1 0 0 0-.541-.54C11.199 6 10.966 6 10.5 6s-.699 0-.883.076a1 1 0 0 0-.54.541C9 6.801 9 7.034 9 7.5v1c0 .466 0 .699.076.883a1 1 0 0 0 .541.54c.184.077.417.077.883.077s.699 0 .883-.076a1 1 0 0 0 .54-.541C12 9.199 12 8.966 12 8.5z" };
+
 struct SvgIcon { const char* const* paths; int n; };
 static const SvgIcon kIcons[6] = {
     { IC_SCROLL, 2 }, { IC_POINTER, 1 }, { IC_CLICK, 2 }, { IC_MOD, 1 }, { IC_GEN, 2 }, { IC_HEART, 1 }
 };
+// "Mouse Icons" pack, ready to use anywhere via drawSvg(). kMouseScrollIcon reuses
+// the scroll-wheel mouse (hugeicons mouse-scroll-01 == IC_SCROLL).
+static const SvgIcon kMouseDeviceIcon = { IC_MOUSE_DEVICE, 3 };
+static const SvgIcon kMouseLeftIcon   = { IC_MOUSE_LEFT, 4 };
+static const SvgIcon kMouseRightIcon  = { IC_MOUSE_RIGHT, 4 };
+static const SvgIcon kMouseScrollIcon = { IC_SCROLL, 2 };
+// Pick the glyph that best represents a physical button (middle = scroll wheel).
+static const SvgIcon& mouseGlyphFor(int button) {
+    return button == 3 ? kMouseScrollIcon : kMouseDeviceIcon;
+}
 static const SvgIcon kMouseIcon  = { IC_MOUSE, 2 };   // app / tray icon
 static const SvgIcon kGlobeIcon  = { IC_GLOBE, 3 };
 static const SvgIcon kMailIcon   = { IC_MAIL, 2 };
@@ -290,7 +342,11 @@ static void LoadConfig() {
     g_cfg.noAccel      = GetPrivateProfileIntW(L"pointer", L"noAccel", 0, p.c_str());
     g_maps.clear();
     int n = GetPrivateProfileIntW(L"buttons", L"count", -1, p.c_str());
-    if (n < 0) { g_maps.push_back({ 4 }); g_maps.push_back({ 5 }); }   // seed Back / Forward
+    if (n < 0) {                              // first run: seed MMF-style defaults so it works out of the box
+        g_maps.push_back({ 4 });              // Back  — native click
+        BtnMap b5{ 5 }; b5.scroll = 2; b5.drag = 1;   // Forward — hold+scroll = Zoom, hold+drag = Scroll (pan)
+        g_maps.push_back(b5);
+    }
     else for (int i = 0; i < n; i++) {
         wchar_t k[16]; BtnMap m;
         wsprintfW(k, L"b%d", i);  m.button = GetPrivateProfileIntW(L"buttons", k, 4, p.c_str());
@@ -306,6 +362,11 @@ static void LoadConfig() {
         wsprintfW(k, L"tc%d", i); GetPrivateProfileStringW(L"buttons", k, L"", tb, 512, p.c_str()); m.txtC = tb;
         wsprintfW(k, L"td%d", i); GetPrivateProfileStringW(L"buttons", k, L"", tb, 512, p.c_str()); m.txtD = tb;
         wsprintfW(k, L"th%d", i); GetPrivateProfileStringW(L"buttons", k, L"", tb, 512, p.c_str()); m.txtH = tb;
+        wsprintfW(k, L"gu%d", i); m.gU = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
+        wsprintfW(k, L"gd%d", i); m.gD = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
+        wsprintfW(k, L"gl%d", i); m.gL = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
+        wsprintfW(k, L"gr%d", i); m.gR = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
+        if (m.button < 3 || m.button > 5) continue;   // drop any primary/secondary map from older configs
         g_maps.push_back(m);
     }
 }
@@ -347,6 +408,10 @@ static void SaveConfig() {
         wsprintfW(k, L"tc%d", (int)i); WritePrivateProfileStringW(L"buttons", k, m.txtC.c_str(), p.c_str());
         wsprintfW(k, L"td%d", (int)i); WritePrivateProfileStringW(L"buttons", k, m.txtD.c_str(), p.c_str());
         wsprintfW(k, L"th%d", (int)i); WritePrivateProfileStringW(L"buttons", k, m.txtH.c_str(), p.c_str());
+        wsprintfW(k, L"gu%d", (int)i); Wc(L"buttons", k, m.gU);
+        wsprintfW(k, L"gd%d", (int)i); Wc(L"buttons", k, m.gD);
+        wsprintfW(k, L"gl%d", (int)i); Wc(L"buttons", k, m.gL);
+        wsprintfW(k, L"gr%d", (int)i); Wc(L"buttons", k, m.gR);
     }
 }
 
@@ -726,8 +791,14 @@ static BtnMap* findMap(int button) {
     for (auto& m : g_maps) if (m.button == button) return &m;
     return nullptr;
 }
-static int nativeClick(int button) { return button == 3 ? 1 : button == 4 ? 4 : 5; }  // middle/back/forward
+// The action that reproduces a button's native click. 20/21 are internal-only codes
+// (not in the UI list) for a real left/right click, used when a remapped primary
+// button's Click is left at "Default".
+static int nativeClick(int button) {
+    switch (button) { case 1: return 20; case 2: return 21; case 3: return 1; case 4: return 4; default: return 5; }
+}
 static void fireAct(int action, int combo, const std::wstring& text);
+static void MouseBtnUp(int a);   // release a mouse button held by a Hold gesture (defined with the emitters)
 
 static void wakeAnim() { if (g_wake) SetEvent(g_wake); }
 
@@ -736,16 +807,27 @@ static void wakeAnim() { if (g_wake) SetEvent(g_wake); }
 // the window's average speed — instant response — while momentum carried in
 // `vel` from previous notches keeps sustained scrolling one continuous motion.
 // The cubic lands at exactly zero velocity, so the glide can't creep or cliff.
-static void queueScroll(ScrollAxis& ax, double dist, double cap) {
+static void queueScroll(ScrollAxis& ax, double dist, double cap, double rOverride = 0.0) {
     if ((dist > 0 && ax.rem < 0) || (dist < 0 && ax.rem > 0)) { ax.rem = 0; ax.vel = 0; }  // crisp reversal
     ax.rem += dist;
     if (ax.rem >  cap) ax.rem =  cap;
     if (ax.rem < -cap) ax.rem = -cap;
-    int s = (g_cfg.smoothness >= 1 && g_cfg.smoothness <= 5) ? g_cfg.smoothness : 3;
-    ax.R = kDurBySmoothness[s];
+    if (rOverride > 0.0) ax.R = rOverride;    // drag-pan wants a short fixed glide, not the smoothness curve
+    else { int s = (g_cfg.smoothness >= 1 && g_cfg.smoothness <= 5) ? g_cfg.smoothness : 3; ax.R = kDurBySmoothness[s]; }
     double vAvg = ax.rem / ax.R, vMax = 3.0 * ax.rem / ax.R;   // vel > 3D/T makes the cubic overshoot
     if (ax.rem > 0) { if (ax.vel < vAvg) ax.vel = vAvg; else if (ax.vel > vMax) ax.vel = vMax; }
     else            { if (ax.vel > vAvg) ax.vel = vAvg; else if (ax.vel < vMax) ax.vel = vMax; }
+    wakeAnim();
+}
+
+// Release momentum: seed a cubic that decelerates from the given velocity to a
+// stop. With rem = vel·R the Hermite glide is monotonic (no reversal) and always
+// lands at v=0, so a fast flick coasts far and a slow one barely moves.
+static void launchInertia(ScrollAxis& ax, double vel /*units/ms*/, double R, double cap) {
+    if (vel > -kInertiaMinVel && vel < kInertiaMinVel) return;   // too slow -> stop dead
+    ax.R = R; ax.vel = vel; ax.rem = vel * R;
+    if (ax.rem >  cap) ax.rem =  cap;
+    if (ax.rem < -cap) ax.rem = -cap;
     wakeAnim();
 }
 
@@ -771,6 +853,28 @@ static bool cursorOverProtectedWindow(POINT pt) {
     return prot;
 }
 
+// Map a button message to our button code: 1 left · 2 right · 3 middle · 4 back · 5 fwd.
+static int btnFromMsg(WPARAM w, const MSLLHOOKSTRUCT* ms) {
+    switch (w) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: return 1;
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: return 2;
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: return 3;
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP: return HIWORD(ms->mouseData) == XBUTTON1 ? 4 : 5;
+    }
+    return 0;
+}
+// Safety net for remapping the PRIMARY (left/right) buttons: a click over smooly's own
+// window or the shell (taskbar/tray) is never swallowed, so you can always reach the UI
+// (or the tray) to undo a mapping — plus the Ctrl+Alt+S hotkey always opens settings.
+static bool clickPassNative(POINT pt) {
+    HWND w = WindowFromPoint(pt);
+    if (!w) return false;
+    HWND root = GetAncestor(w, GA_ROOT);
+    if (g_wnd && root == g_wnd) return true;
+    wchar_t cls[64] = {}; GetClassNameW(root, cls, 63);
+    return !lstrcmpW(cls, L"Shell_TrayWnd") || !lstrcmpW(cls, L"Shell_SecondaryTrayWnd");
+}
+
 // ------------------------------------------------------------------ engine
 LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     static bool suppressUp = false;   // swallow the release of a click we turned into a gesture
@@ -783,20 +887,49 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     switch (wParam) {
     case WM_MOUSEMOVE: {
         if (ms->flags & LLMHF_INJECTED) break;
+        if (g_cCopyArmed) {                        // C + left-drag: note that a selection is being made
+            int ddx = ms->pt.x - g_cDownX, ddy = ms->pt.y - g_cDownY;
+            if ((ddx < 0 ? -ddx : ddx) + (ddy < 0 ? -ddy : ddy) >= kDragPx) g_cCopyDragged = true;
+        }
         if (g_pBtn.load()) {                       // a managed button is held
             int da = g_pDragAction.load();
+            if (da == 6) break;                    // Precision: pointer already slowed on press; let it move freely
             if (da != 0) {
                 int dx = ms->pt.x - g_dragLastX, dy = ms->pt.y - g_dragLastY;
                 g_dragLastX = ms->pt.x; g_dragLastY = ms->pt.y;
+                if (da == 7) { g_gestDx += dx; g_gestDy += dy; }   // Gesture: track net displacement for the flick
                 g_dragTotal += (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
                 if (g_dragTotal >= kDragPx || g_pDragged.load()) {
                     bool first = !g_pDragged.exchange(true);
-                    if (da == 1) { g_panV.fetch_add(dy * kDragScroll); g_panH.fetch_add(dx * kDragScroll); }
-                    else if (da == 2) {
+                    if (da == 1 || da == 2) {      // pan: Scroll (1) frozen-cursor · Grab (2) cursor follows
+                        if (da == 2 && first) g_grabWant.store(true);   // Grab shows the hand cursor
+                        // Feed the drag through the smooth engine with a SHORT glide so the content
+                        // tracks the hand tightly (a long glide balloons the pending distance and
+                        // lags), and track velocity for the release coast. Drag down -> content down.
+                        double uv = dy * kDragPanUnits, uh = -dx * kDragPanUnits;
+                        LONGLONG t = nowTicks();
+                        if (first) { g_dragVX = g_dragVY = 0; }
+                        else { double dtm = ticksToMs(t - g_dragLastT);
+                               if (dtm > 0.5) { g_dragVY = g_dragVY * 0.6 + (uv / dtm) * 0.4;
+                                                g_dragVX = g_dragVX * 0.6 + (uh / dtm) * 0.4; } }
+                        g_dragLastT = t;
+                        { std::lock_guard<std::mutex> lock(g_mutex);
+                          queueScroll(g_axV, uv, kInertiaCap, kDragGlideMs);
+                          queueScroll(g_axH, uh, kInertiaCap, kDragGlideMs); }
+                        if (da == 2) break;        // Grab: let the pointer travel with the hand (no freeze, no snap)
+                        return 1;                  // Scroll: freeze the pointer (classic pan)
+                    }
+                    else if (da == 3) {            // switch desktop
                         g_dragAccX += dx;
                         if (g_dragAccX >= kDeskPx) { g_dragCmd.store(2); g_dragAccX = 0; }
                         else if (g_dragAccX <= -kDeskPx) { g_dragCmd.store(1); g_dragAccX = 0; }
-                    } else if (da == 3 && first) g_dragCmd.store(3);
+                    }
+                    else if (da == 5) {            // navigate back / forward on a horizontal swipe
+                        g_dragAccX += dx;
+                        if (g_dragAccX >= kNavPx) { g_dragCmd.store(5); g_dragAccX = 0; }        // right -> forward
+                        else if (g_dragAccX <= -kNavPx) { g_dragCmd.store(4); g_dragAccX = 0; }  // left -> back
+                    }
+                    else if (da == 4 && first) g_dragCmd.store(3);     // Task View
                     return 1;                      // consume the move (freeze the cursor)
                 }
             }
@@ -806,28 +939,100 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
     case WM_XBUTTONDOWN: {
-        int btn = (wParam == WM_MBUTTONDOWN) ? 3 : (HIWORD(ms->mouseData) == XBUTTON1 ? 4 : 5);
+        int btn = btnFromMsg(wParam, ms);
+        // Primary (left/right) safety: never swallow a click over our own UI or the shell.
+        if (btn <= 2 && clickPassNative(ms->pt)) break;
+        bool managed = false;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             BtnMap* m = findMap(btn);
-            if (!m) break;                     // unmanaged -> native (lets the capture box register it)
-            if (!m->click && !m->dbl && !m->hold && !m->scroll && !m->drag) break;   // all default -> native
-            g_pBtn.store(btn); g_pDownAt.store(nowTicks());
-            g_pHoldFired.store(false); g_pScrolled.store(false); g_pDragged.store(false);
-            g_pHoldAction.store(m->hold); g_pHoldCombo.store(m->keyH); g_pDragAction.store(m->drag);
-            g_pHoldText = m->txtH;
+            // Capture (swallow) when a trigger needs the button held/replaced. For a PRIMARY
+            // button, scroll-ONLY does not capture, so native click/drag-select survive and the
+            // wheel handler applies the scroll gesture from the physical button-held state.
+            // Only middle/back/forward are ever managed — the primary (left) and secondary
+            // (right) buttons stay 100% native so you can never lock yourself out.
+            bool needsCapture = btn > 2 && m && (m->click || m->dbl || m->hold || m->drag || m->scroll);
+            if (needsCapture) {
+                g_pBtn.store(btn); g_pDownAt.store(nowTicks());
+                g_pHoldFired.store(false); g_pScrolled.store(false); g_pDragged.store(false);
+                g_pHoldAction.store(m->hold); g_pHoldCombo.store(m->keyH); g_pDragAction.store(m->drag);
+                g_pHoldText = m->txtH;
+                managed = true;
+            }
         }
-        g_dragLastX = ms->pt.x; g_dragLastY = ms->pt.y; g_dragTotal = 0; g_dragAccX = 0;
-        wakeAnim();                            // the anim thread times the Hold gesture
-        return 1;                              // swallow; decide click / hold / scroll / drag
+        if (managed) {
+            g_dragLastX = ms->pt.x; g_dragLastY = ms->pt.y; g_dragTotal = 0; g_dragAccX = 0;
+            g_gestDx = 0; g_gestDy = 0;
+            int da0 = g_pDragAction.load();
+            if (da0 == 6 || da0 == 7) g_pHoldAction.store(0);   // Precision/Gesture own the button: no Hold gesture
+            if (da0 == 6) {                                     // engage Precision: slow the OS pointer while held
+                int sp = 10; SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &sp, 0);
+                g_precSaved = sp;
+                int slow = (int)(sp * kPrecisionFactor + 0.5); if (slow < 1) slow = 1; if (slow > 20) slow = 20;
+                SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)slow, 0);
+            }
+            wakeAnim();                        // the anim thread times the Hold gesture
+            return 1;                          // swallow; decide click / hold / scroll / drag
+        }
+        // Unmanaged left button: click-selection gestures.
+        if (wParam == WM_LBUTTONDOWN && g_cfg.gestures) {
+            if (g_cHeld.load()) {                        // hold C + drag-select -> auto-copy on release
+                g_cCopyArmed = true; g_cCopyDragged = false; g_cDownX = ms->pt.x; g_cDownY = ms->pt.y;
+                g_cModifierActive.store(true);           // C is now the copy modifier: keep 'c' suppressed until released
+                // stays native: the user makes a normal selection; we copy it when the button is released
+            } else if (GetAsyncKeyState(VK_MENU) & 0x8000) {   // Alt-click selects a word
+                g_gesture.store(2); suppressUp = true; wakeAnim(); return 1;
+            }
+        }
+        break;                                 // native (also lets the capture box register the button)
     }
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
     case WM_MBUTTONUP:
     case WM_XBUTTONUP: {
-        int btn = (wParam == WM_MBUTTONUP) ? 3 : (HIWORD(ms->mouseData) == XBUTTON1 ? 4 : 5);
-        if (g_pBtn.load() != btn) break;
+        int btn = btnFromMsg(wParam, ms);
+        if (wParam == WM_LBUTTONUP && g_cCopyArmed) {   // C + drag-select released -> copy the selection
+            g_cCopyArmed = false;
+            if (g_cCopyDragged) { g_copyDeadline.store(GetTickCount64() + 60); wakeAnim(); }  // let the selection settle, then Ctrl+C
+        }
+        if (g_pBtn.load() != btn) {
+            if (wParam == WM_LBUTTONUP && suppressUp) { suppressUp = false; return 1; }  // the gesture's release
+            break;
+        }
         g_pBtn.store(0);
+        if (int hb = g_holdHeldBtn.exchange(0)) MouseBtnUp(hb);   // release a mouse button held by a Hold gesture
+        {   // Precision: restore the pointer speed. Gesture: resolve the flick direction.
+            int da = g_pDragAction.load();
+            if (da == 6) {
+                if (g_precSaved) { SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)g_precSaved, 0); g_precSaved = 0; }
+                return 1;                                  // dedicated Precision button: no click on release
+            }
+            if (da == 7) {
+                int adx = g_gestDx < 0 ? -g_gestDx : g_gestDx, ady = g_gestDy < 0 ? -g_gestDy : g_gestDy;
+                if (g_pDragged.load() && (adx >= kGestureMinPx || ady >= kGestureMinPx)) {
+                    int act = 0;
+                    { std::lock_guard<std::mutex> lock(g_mutex); BtnMap* m = findMap(btn);
+                      int u = m ? m->gU : 0, dn = m ? m->gD : 0, l = m ? m->gL : 0, r = m ? m->gR : 0;
+                      act = (adx >= ady) ? (g_gestDx > 0 ? r : l) : (g_gestDy > 0 ? dn : u); }
+                    if (act > 0) { g_gestCmd.store(act); wakeAnim(); }
+                    return 1;                              // flick consumed (no click)
+                }
+                // movement too small for a flick -> fall through to normal click handling
+            }
+        }
+        { int da = g_pDragAction.load();
+          // Coast only if the finger was still moving at release; holding still first
+          // (stale velocity) should stop dead.
+          if (g_pDragged.load() && (da == 1 || da == 2) && ticksToMs(nowTicks() - g_dragLastT) < 40.0) {
+              std::lock_guard<std::mutex> lock(g_mutex);
+              launchInertia(g_axV, g_dragVY, kInertiaMs, kInertiaCap);
+              launchInertia(g_axH, g_dragVX, kInertiaMs, kInertiaCap);
+          } }
+        if (g_grabWant.exchange(false)) wakeAnim();   // end a grab -> anim restores the theme cursors
         if (g_pScrolled.load() || g_pHoldFired.load() || g_pDragged.load()) return 1;  // consumed
         int clickAct, clickCombo, dblAct, dblCombo; std::wstring clickText, dblText;
         {
@@ -853,28 +1058,19 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         return 1;
     }
 
-    case WM_LBUTTONDOWN:
-        if (g_cfg.gestures) {
-            bool shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
-            bool alt   = GetAsyncKeyState(VK_MENU)  & 0x8000;
-            // Shift+click is left native (text range-selection); only Alt gestures.
-            int g = (alt && shift) ? 3 : alt ? 2 : 0;
-            if (g) { g_gesture.store(g); suppressUp = true; wakeAnim(); return 1; }
-        }
-        break;
-
-    case WM_LBUTTONUP:
-        if (suppressUp) { suppressUp = false; return 1; }
-        break;
-
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL: {
+        if (nowTicks() < g_touchpadUntil.load()) break;   // recent touchpad use -> already smooth, don't double-smooth
         bool  horizWheel = (wParam == WM_MOUSEHWHEEL);
         short delta      = (short)HIWORD(ms->mouseData);
         bool  ctrl       = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool  shift      = GetAsyncKeyState(VK_SHIFT)   & 0x8000;
 
         int held = g_pBtn.load();                              // Click + Scroll gesture
+        if (!held) {                                           // primary (left/right) held natively (not swallowed)
+            int pb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? 2 : 0;
+            if (pb) { std::lock_guard<std::mutex> lock(g_mutex); BtnMap* m = findMap(pb); if (m && m->scroll) held = pb; }
+        }
         if (!horizWheel && held) {
             int sa; { std::lock_guard<std::mutex> lock(g_mutex); BtnMap* m = findMap(held); sa = m ? m->scroll : 0; }
             if (sa != 0) {
@@ -996,6 +1192,20 @@ static void MouseX(DWORD flag, int xb) {
     in.mi.dwFlags = flag; in.mi.mouseData = (DWORD)xb; in.mi.dwExtraInfo = kInjectTag;
     SendInput(1, &in, sizeof(INPUT));
 }
+// Mouse-button actions (1 Middle · 4 Back · 5 Forward) as separate down/up, so a
+// Hold gesture can press on hold-fire and release on button-up (behave like really
+// holding that button, not just clicking it).
+static bool isMouseBtnAction(int a) { return a == 1 || a == 4 || a == 5; }
+static void MouseBtnDown(int a) {
+    if (a == 1) MouseClick(MOUSEEVENTF_MIDDLEDOWN);
+    else if (a == 4) MouseX(MOUSEEVENTF_XDOWN, XBUTTON1);
+    else if (a == 5) MouseX(MOUSEEVENTF_XDOWN, XBUTTON2);
+}
+static void MouseBtnUp(int a) {
+    if (a == 1) MouseClick(MOUSEEVENTF_MIDDLEUP);
+    else if (a == 4) MouseX(MOUSEEVENTF_XUP, XBUTTON1);
+    else if (a == 5) MouseX(MOUSEEVENTF_XUP, XBUTTON2);
+}
 static void PerformButtonAction(int a) {   // see kButtonActions (1..6; 0/7 handled elsewhere)
     switch (a) {
     case 1: MouseClick(MOUSEEVENTF_MIDDLEDOWN); MouseClick(MOUSEEVENTF_MIDDLEUP); break;
@@ -1003,6 +1213,8 @@ static void PerformButtonAction(int a) {   // see kButtonActions (1..6; 0/7 hand
     case 3: SendKey(VK_CONTROL, false); SendKey('V', false); SendKey('V', true); SendKey(VK_CONTROL, true); break;
     case 4: MouseX(MOUSEEVENTF_XDOWN, XBUTTON1); MouseX(MOUSEEVENTF_XUP, XBUTTON1); break;
     case 5: MouseX(MOUSEEVENTF_XDOWN, XBUTTON2); MouseX(MOUSEEVENTF_XUP, XBUTTON2); break;
+    case 20: MouseClick(MOUSEEVENTF_LEFTDOWN);  MouseClick(MOUSEEVENTF_LEFTUP);  break;  // native left  (Default on a remapped left)
+    case 21: MouseClick(MOUSEEVENTF_RIGHTDOWN); MouseClick(MOUSEEVENTF_RIGHTUP); break;  // native right (Default on a remapped right)
     }
 }
 static void PerformKeyCombo(int c) {       // packed (mods<<8)|vk
@@ -1017,6 +1229,26 @@ static void PerformKeyCombo(int c) {       // packed (mods<<8)|vk
     if (mods & 4) SendKey(VK_MENU, true);
     if (mods & 2) SendKey(VK_SHIFT, true);
     if (mods & 1) SendKey(VK_CONTROL, true);
+}
+static void TapKey(WORD vk) { SendKey(vk, false); SendKey(vk, true); }   // media / volume keys
+// Run a gesture-direction action (on the animation thread). See kGestureActions.
+static void PerformGestureAction(int a) {
+    switch (a) {
+    case 1:  PerformButtonAction(4); break;                     // Back
+    case 2:  PerformButtonAction(5); break;                     // Forward
+    case 3:  PerformKeyCombo(((1 | 8) << 8) | VK_LEFT);  break; // Desktop left  (Ctrl+Win+Left)
+    case 4:  PerformKeyCombo(((1 | 8) << 8) | VK_RIGHT); break; // Desktop right (Ctrl+Win+Right)
+    case 5:  PerformKeyCombo((8 << 8) | VK_TAB); break;         // Task View     (Win+Tab)
+    case 6:  PerformKeyCombo((8 << 8) | 'D');   break;          // Show desktop  (Win+D)
+    case 7:  TapKey(VK_MEDIA_NEXT_TRACK); break;
+    case 8:  TapKey(VK_MEDIA_PREV_TRACK); break;
+    case 9:  TapKey(VK_MEDIA_PLAY_PAUSE); break;
+    case 10: TapKey(VK_VOLUME_UP);   break;
+    case 11: TapKey(VK_VOLUME_DOWN); break;
+    case 12: PerformButtonAction(2); break;                     // Copy
+    case 13: PerformButtonAction(3); break;                     // Paste
+    case 14: PerformButtonAction(1); break;                     // Middle click
+    }
 }
 static void TypeText(const std::wstring& s) {   // type a string via Unicode key events
     for (wchar_t c : s) {
@@ -1070,18 +1302,25 @@ static void AnimationLoop() {
         if (int zd = g_zoomDelta.exchange(0)) {                       // Click + Scroll = zoom
             SendKey(VK_CONTROL, false); EmitWheel(false, zd); SendKey(VK_CONTROL, true);
         }
-        { int pv = g_panV.exchange(0), ph = g_panH.exchange(0);       // Click + Drag = pan
-          if (pv) EmitWheel(false, pv); if (ph) EmitWheel(true, -ph); }
+        // Click + Drag = pan/grab now feeds g_axV/g_axH directly (smooth engine below);
+        // no separate raw-wheel emit path.
         if (int dc = g_dragCmd.exchange(0)) {                         // Click + Drag = navigate
-            if (dc == 1) PerformKeyCombo(((1 | 8) << 8) | VK_LEFT);
-            else if (dc == 2) PerformKeyCombo(((1 | 8) << 8) | VK_RIGHT);
-            else if (dc == 3) PerformKeyCombo((8 << 8) | VK_TAB);
+            if (dc == 1) PerformKeyCombo(((1 | 8) << 8) | VK_LEFT);   // desktop left
+            else if (dc == 2) PerformKeyCombo(((1 | 8) << 8) | VK_RIGHT); // desktop right
+            else if (dc == 3) PerformKeyCombo((8 << 8) | VK_TAB);     // Task View
+            else if (dc == 4) PerformButtonAction(4);                // Back
+            else if (dc == 5) PerformButtonAction(5);                // Forward
         }
+        if (int gc = g_gestCmd.exchange(0)) PerformGestureAction(gc);   // Click + Drag = Gesture (flick)
+        if (ULONGLONG cd = g_copyDeadline.load())                       // C + drag-select = auto-copy (deferred)
+            if (GetTickCount64() >= cd) { g_copyDeadline.store(0); PerformButtonAction(2); }
         if (g_pBtn.load() && !g_pHoldFired.load() && !g_pScrolled.load() && !g_pDragged.load()) {   // hold
-            if (g_pHoldAction.load() && ticksToMs(cur - g_pDownAt.load()) >= kHoldMs) {
+            int ha = g_pHoldAction.load();
+            if (ha && ticksToMs(cur - g_pDownAt.load()) >= kHoldMs) {
                 g_pHoldFired.store(true);
-                std::wstring t; { std::lock_guard<std::mutex> lock(g_mutex); t = g_pHoldText; }
-                performAct(g_pHoldAction.load(), g_pHoldCombo.load(), t);
+                if (isMouseBtnAction(ha)) { MouseBtnDown(ha); g_holdHeldBtn.store(ha); }  // press & hold until release
+                else { std::wstring t; { std::lock_guard<std::mutex> lock(g_mutex); t = g_pHoldText; }
+                       performAct(ha, g_pHoldCombo.load(), t); }                          // one-shot (copy/paste/shortcut/text)
             }
         }
         if (g_pendAction.load() && cur >= g_pendDeadline.load()) {    // deferred single-click
@@ -1120,6 +1359,15 @@ static void AnimationLoop() {
             }
         }
 
+        // Grab (hand-pan): swap every cursor to a hand while a grab-drag is held, and
+        // restore the theme cursors on release. Gated on !g_cursorBig so a finishing
+        // shake zoom doesn't fight it (it re-applies a frame later once shake settles).
+        {
+            bool want = g_grabWant.load();
+            if (want && !g_grabApplied.load() && !g_cursorBig) { ApplyGrabCursor(); g_grabApplied.store(true); }
+            else if (!want && g_grabApplied.load())            { ReleaseGrabCursor(); g_grabApplied.store(false); }
+        }
+
         double emitV = 0.0, emitH = 0.0;
         bool scrollBusy;
         {
@@ -1154,7 +1402,8 @@ static void AnimationLoop() {
         bool busy = scrollBusy || g_shakeScale > 1.0
                  || (g_cfg.shake && g_bigUntil.load() > cur)
                  || g_pBtn.load() || g_pendAction.load() || g_gesture.load() || g_actReady.load()
-                 || g_zoomDelta.load() || g_panV.load() || g_panH.load() || g_dragCmd.load();
+                 || g_zoomDelta.load() || g_dragCmd.load() || g_gestCmd.load() || g_copyDeadline.load()
+                 || g_grabWant.load() || g_grabApplied.load();
         if (!busy) {
             nextDue = 0;
             WaitForSingleObjectEx(g_wake, 100, FALSE);
@@ -1177,6 +1426,8 @@ static void AnimationLoop() {
             }
         }
     }
+    if (int hb = g_holdHeldBtn.exchange(0)) MouseBtnUp(hb);   // don't leave a mouse button stuck down
+    if (g_grabApplied.load()) { ReleaseGrabCursor(); g_grabApplied.store(false); }
     if (g_cursorBig) { FreeShakeBase(); RestoreCursors(); g_cursorBig = false; }
     if (hrTimer) CloseHandle(hrTimer);
     timeEndPeriod(1);
@@ -1189,10 +1440,30 @@ static void AnimationLoop() {
 // the hook and scrolling "randomly" reverts to native — invisible to us — so a
 // watchdog timer also re-installs the hook every 2 minutes.
 static HANDLE g_hookReady = nullptr;   // signaled once the install attempt finished
+// Persistent keyboard hook: track the C key so a C+drag-select can auto-copy, and swallow
+// the 'c' character while it's acting as that modifier (left button physically held).
+LRESULT CALLBACK KbProc(int nc, WPARAM wp, LPARAM lp) {
+    if (nc == HC_ACTION) {
+        KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lp;
+        if (k->vkCode == 'C' && !(k->flags & LLKHF_INJECTED)) {
+            bool up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+            if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) g_cHeld.store(true);
+            else if (up) g_cHeld.store(false);
+            // Suppress the 'c' character for the whole time C is used as the copy modifier —
+            // from a left press while held (g_cModifierActive) or any moment the left button is
+            // physically down — through the eventual C release (so it can't spam 'c' afterwards).
+            bool suppress = g_cfg.gestures && (g_cModifierActive.load() || (GetAsyncKeyState(VK_LBUTTON) & 0x8000));
+            if (up) g_cModifierActive.store(false);
+            if (suppress) return 1;
+        }
+    }
+    return CallNextHookEx(g_kbHook, nc, wp, lp);
+}
 static void HookThread(HINSTANCE hInst) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     g_hookTid = GetCurrentThreadId();
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, hInst, 0);
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, hInst, 0);
     SetEvent(g_hookReady);
     if (!g_hook) return;
     SetTimer(nullptr, 0, 120000, nullptr);       // watchdog ticks into this queue
@@ -1201,11 +1472,14 @@ static void HookThread(HINSTANCE hInst) {
         if (m.message == WM_TIMER) {             // re-hook (harmless if still alive)
             UnhookWindowsHookEx(g_hook);
             g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, hInst, 0);
+            if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
+            g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, hInst, 0);
             continue;
         }
         TranslateMessage(&m); DispatchMessageW(&m);
     }
     if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+    if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
 }
 
 // ------------------------------------------------------------------ tray icon
@@ -1223,8 +1497,8 @@ static HICON CreateBrandIcon() {
         Gdiplus::GraphicsPath p; float d = 13;
         p.AddArc(0.f, 0.f, d, d, 180, 90); p.AddArc(sz - d, 0.f, d, d, 270, 90);
         p.AddArc((float)sz - d, (float)sz - d, d, d, 0, 90); p.AddArc(0.f, (float)sz - d, d, d, 90, 90); p.CloseFigure();
-        Gdiplus::SolidBrush b(gpc(RGB(0x2f, 0x8f, 0xff))); g.FillPath(&b, &p);
-        drawSvgG(g, 6, 6, 20, RGB(255, 255, 255), kMouseIcon, 1.9, true);
+        Gdiplus::SolidBrush b(gpc(C_ACCENT)); g.FillPath(&b, &p);
+        drawSvgG(g, 6, 6, 20, C_BG, kMouseIcon, 1.9, true);   // dark mouse on the light brand square
     }
     Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, sz, sz);
     HICON icon = nullptr;
@@ -1274,7 +1548,7 @@ static bool ddInfo(int id, DdInfo& d) {
     static const wchar_t* ac[] = { L"Off", L"Low", L"Medium", L"High" };
     d = {};
     if (id >= ID_DYN_BASE && id < ID_DYN_REMOVE) {
-        int mi = (id - ID_DYN_BASE) / 8, tr = (id - ID_DYN_BASE) % 8;
+        int mi = (id - ID_DYN_BASE) / 16, tr = (id - ID_DYN_BASE) % 16;
         if (mi < 0 || mi >= (int)g_maps.size()) return false;
         BtnMap& m = g_maps[mi];
         switch (tr) {
@@ -1282,7 +1556,11 @@ static bool ddInfo(int id, DdInfo& d) {
         case 1: d.val = &m.dbl;    d.opts = kButtonActions; d.n = 9; return true;
         case 2: d.val = &m.hold;   d.opts = kButtonActions; d.n = 9; return true;
         case 3: d.val = &m.scroll; d.opts = kScrollActions; d.n = 4; return true;
-        case 4: d.val = &m.drag;   d.opts = kDragActions;   d.n = 4; return true;
+        case 4: d.val = &m.drag;   d.opts = kDragActions;   d.n = 8; return true;
+        case 5: d.val = &m.gU;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
+        case 6: d.val = &m.gD;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
+        case 7: d.val = &m.gL;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
+        case 8: d.val = &m.gR;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
         }
         return false;
     }
@@ -1324,8 +1602,9 @@ static std::wstring ddText(int id) {
     if (!ddInfo(id, d)) return L"";
     if (d.theme) return g_cfg.theme.empty() ? L"Windows Default" : g_cfg.theme;
     int v = *d.val; if (v < 0 || v >= d.n) v = 0;
-    if ((v == 7 || v == 8) && id >= ID_DYN_BASE && id < ID_DYN_REMOVE) {
-        int mi = (id - ID_DYN_BASE) / 8, tr = (id - ID_DYN_BASE) % 8;
+    if ((v == 7 || v == 8) && id >= ID_DYN_BASE && id < ID_DYN_REMOVE
+        && ((id - ID_DYN_BASE) % 16) <= 2) {           // only Click/Double/Hold carry combos/text
+        int mi = (id - ID_DYN_BASE) / 16, tr = (id - ID_DYN_BASE) % 16;
         if (mi >= 0 && mi < (int)g_maps.size()) {
             const BtnMap& m = g_maps[mi];
             if (v == 7) return comboText(tr == 0 ? m.keyC : tr == 1 ? m.keyD : m.keyH);   // captured combo
@@ -1431,6 +1710,16 @@ static void relayout(HWND h) {
 static void ShowPage(int p) {
     g_page = p;
     relayout(g_wnd);
+    if (!g_wnd) return;
+    int mb = 0;                                            // deepest visible control on this page
+    for (auto& r : g_rows) if (r.page == p) { int b = r.top + r.h; if (b > mb) mb = b; }
+    int wantClient = mb + P(48);                           // leave room for the footer line
+    if (wantClient < P(WIN_H)) wantClient = P(WIN_H);      // never shrink below the base height
+    RECT wr, cr; GetWindowRect(g_wnd, &wr); GetClientRect(g_wnd, &cr);
+    int nc = (wr.bottom - wr.top) - (cr.bottom - cr.top);  // title bar + borders
+    int wantWin = wantClient + nc;
+    if (wr.bottom - wr.top != wantWin)
+        SetWindowPos(g_wnd, nullptr, 0, 0, wr.right - wr.left, wantWin, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static Gdiplus::Color gpc(COLORREF c);
@@ -1500,6 +1789,8 @@ LRESULT CALLBACK CaptureProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         pth.AddArc(x, y, d, d, 180, 90); pth.AddArc(x + ww - d, y, d, d, 270, 90);
         pth.AddArc(x + ww - d, y + hh - d, d, d, 0, 90); pth.AddArc(x, y + hh - d, d, d, 90, 90); pth.CloseFigure();
         g.DrawPath(&pen, &pth);
+        int gsz = P(26);   // "Mouse Icons" pack glyph, left of the hint text
+        drawSvgG(g, rc.left + P(24), (rc.bottom - gsz) / 2, gsz, C_TEXT2, kMouseDeviceIcon, 1.9, false);
         SetBkMode(dc, TRANSPARENT); SetTextColor(dc, C_TEXT2); SelectObject(dc, g_font);
         DrawTextW(dc, L"Click a mouse button here (middle / back / forward) to add it",
                   -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1593,7 +1884,13 @@ static void BuildButtonsPage(HWND hwnd) {
         L"Hold the button, then spin the wheel",
         L"Hold the button, then move the mouse" };
     int mi = g_selBtn;                                   // only the selected button's card
-    for (int tr = 0; tr < 5; tr++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 8 + tr, trg[tr], y, trgD[tr]); y += P(ROW_H); }
+    for (int tr = 0; tr < 5; tr++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 16 + tr, trg[tr], y, trgD[tr]); y += P(ROW_H); }
+    if (g_maps[mi].drag == 7) {                          // Gesture: 4 direction actions
+        static const wchar_t* gname[4] = { L"Gesture ↑ Up", L"Gesture ↓ Down", L"Gesture ← Left", L"Gesture → Right" };
+        static const wchar_t* gdesc[4] = { L"Flick up while holding the button", L"Flick down while holding the button",
+                                           L"Flick left while holding the button", L"Flick right while holding the button" };
+        for (int g = 0; g < 4; g++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 16 + 5 + g, gname[g], y, gdesc[g]); y += P(ROW_H); }
+    }
     addRow(hwnd, 2, mi, 5, ID_DYN_REMOVE + mi, L"Remove this button", y, L"Forget this mapping and restore default");
 }
 static void RebuildButtons(HWND hwnd) {
@@ -1610,14 +1907,13 @@ static void RebuildButtons(HWND hwnd) {
 // static text (name, version, credit, contact, headers) is painted in drawAbout().
 static void BuildAboutPage(HWND hwnd) {
     const int cardL = P(SB_W + 28), cardR = P(WIN_W - 28);
-    const int inL = cardL + P(26), inR = cardR - P(26);
-    HWND d = makeOwnerBtn(hwnd, ID_DONATE, inL, P(276), inR - inL, P(42));
-    g_rows.push_back({ PAGE_ABOUT, -3, 7, P(276), P(42), inL, P(276), P(42), d, L"♥  Donate", L"" });
+    HWND d = makeOwnerBtn(hwnd, ID_DONATE, cardL, P(250), P(150), P(42));   // compact, left-aligned pill
+    g_rows.push_back({ PAGE_ABOUT, -3, 7, P(250), P(42), cardL, P(250), P(42), d, L"♥  Donate", L"" });
     struct { int id; const wchar_t* label; } sec[3] = { { ID_WEBSITE, L"Website" }, { ID_GITHUB, L"GitHub" }, { ID_EMAIL, L"Email" } };
-    int y = P(368), h = P(52);                 // flat, contiguous list rows (dividers drawn per-row)
+    int y = P(346), h = P(52);                 // flat, contiguous list rows (dividers drawn per-row)
     for (int i = 0; i < 3; i++) {
-        HWND c = makeOwnerBtn(hwnd, sec[i].id, inL, y, inR - inL, h);
-        g_rows.push_back({ PAGE_ABOUT, -3, 7, y, h, inL, y, h, c, sec[i].label, L"" });
+        HWND c = makeOwnerBtn(hwnd, sec[i].id, cardL, y, cardR - cardL, h);
+        g_rows.push_back({ PAGE_ABOUT, -3, 7, y, h, cardL, y, h, c, sec[i].label, L"" });
         y += h;
     }
 }
@@ -1639,7 +1935,7 @@ static void BuildControls(HWND hwnd) {
         { 1, 2, 1, ID_THEME,   L"Cursor theme",                       L"Pick a cursor art style" },
         { 1, 2, 1, ID_SIZE,    L"Cursor size",                        L"Overall cursor scale" },
         { 3, 0, 0, ID_CTRLT,   L"Ctrl + wheel turbo",                 L"Hold Ctrl and scroll to move much faster" },
-        { 3, 1, 0, ID_GESTURE, L"Click gestures",                     L"Alt-click selects a line; Alt+Shift copies it" },
+        { 3, 1, 0, ID_GESTURE, L"Click gestures",                     L"Alt-click selects a word; hold C and drag to copy" },
         { 4, 0, 0, ID_STARTUP, L"Launch when Windows starts",         L"Run smooly automatically after you sign in" },
     };
 
@@ -1770,6 +2066,60 @@ static void drawSvg(HDC dc, int x, int y, int size, COLORREF col, const SvgIcon&
     Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     drawSvgG(g, x, y, size, col, ic, strokeW, solid);
 }
+
+// ---- Grab (hand-pan) cursor ------------------------------------------------
+// Render the pan hand once into a system-sized ARGB cursor: a dark rim (wide
+// stroke) under a white fill so it reads on any background, like a real cursor.
+static HCURSOR BuildGrabCursor() {
+    int w = GetSystemMetrics(SM_CXCURSOR), h = GetSystemMetrics(SM_CYCURSOR);
+    if (w < 32) w = 32; if (h < 32) h = 32;
+    Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
+    HCURSOR out = nullptr;
+    {
+        Gdiplus::Graphics g(&bmp);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        double s = (w < h ? w : h) / 24.0 * 0.9;                 // fit the 24-unit icon
+        Gdiplus::GraphicsState st = g.Save();
+        g.TranslateTransform((float)((w - 24 * s) / 2.0), (float)((h - 24 * s) / 2.0));
+        g.ScaleTransform((float)s, (float)s);
+        Gdiplus::GraphicsPath gp; gp.SetFillMode(Gdiplus::FillModeWinding);
+        svgBuild(gp, IC_HANDGRAB[0]);
+        Gdiplus::Pen rim(Gdiplus::Color(255, 22, 22, 26), 2.4f);
+        rim.SetLineJoin(Gdiplus::LineJoinRound);
+        g.DrawPath(&rim, &gp);                                   // dark outline
+        Gdiplus::SolidBrush fill(Gdiplus::Color(255, 255, 255, 255));
+        g.FillPath(&fill, &gp);                                  // white body
+        g.Restore(st);
+    }
+    Gdiplus::Rect rc(0, 0, w, h);
+    Gdiplus::BitmapData bd;
+    if (bmp.LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        std::vector<BYTE> bits((size_t)w * h * 4);
+        for (int y = 0; y < h; y++)
+            memcpy(bits.data() + (size_t)y * w * 4, (BYTE*)bd.Scan0 + (size_t)y * bd.Stride, (size_t)w * 4);
+        bmp.UnlockBits(&bd);
+        out = CursorFromARGB(bits.data(), w, h, w / 2, h / 2);   // hotspot = palm centre
+    }
+    return out;
+}
+
+// Install the grab hand as every (non-animated) cursor role so it shows over any
+// app, exactly like the target would otherwise. SetSystemCursor destroys the
+// handle it's given, so hand each role its own copy.
+static void ApplyGrabCursor() {
+    HCURSOR hand = BuildGrabCursor();
+    if (!hand) return;
+    for (auto& role : kThemeRoles) {
+        if (role.anim) continue;
+        if (HCURSOR c = CopyCursor(hand)) SetSystemCursor(c, role.ocr);
+    }
+    DestroyCursor(hand);
+}
+
+static void ReleaseGrabCursor() {
+    ReassertCursors();   // reload the theme scheme + reapply the chosen size
+}
 static void drawToggle(const DRAWITEMSTRUCT* d) {
     HDC dc = d->hDC; RECT rc = d->rcItem;
     int* v = toggleCfg(d->CtlID); bool on = v && *v;
@@ -1778,7 +2128,8 @@ static void drawToggle(const DRAWITEMSTRUCT* d) {
     fillRound(dc, rc, h, on ? C_ACCENT : C_KNOB);
     int kr = h / 2 - P(3), cy = (rc.top + rc.bottom) / 2;
     int kx = on ? rc.right - h / 2 : rc.left + h / 2;
-    fillEllipse(dc, kx - kr, cy - kr, 2 * kr, 2 * kr, RGB(255, 255, 255));
+    // knob must contrast its track: dark on the light "on" track, light on the dark "off" track.
+    fillEllipse(dc, kx - kr, cy - kr, 2 * kr, 2 * kr, on ? C_BG : RGB(0xcf, 0xcf, 0xcf));
 }
 static void drawDropdown(const DRAWITEMSTRUCT* d) {
     HDC dc = d->hDC; RECT rc = d->rcItem;
@@ -1798,7 +2149,7 @@ static void drawRemove(const DRAWITEMSTRUCT* d) {
     HDC dc = d->hDC; RECT rc = d->rcItem;
     HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &rc, bg); DeleteObject(bg);
     fillRound(dc, rc, P(12), C_CARD2); strokeRound(dc, rc, P(12), C_LINE, 1.0f);
-    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(0xe0, 0x6a, 0x6a));
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, C_DANGER);
     SelectObject(dc, g_font);
     DrawTextW(dc, L"Remove", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
@@ -1806,11 +2157,18 @@ static void drawSelPill(const DRAWITEMSTRUCT* d) {   // Buttons-page selector ta
     HDC dc = d->hDC; RECT rc = d->rcItem;
     bool sel = (int)d->CtlID - ID_SEL_BASE == g_selBtn;
     HBRUSH bg = CreateSolidBrush(C_BG); FillRect(dc, &rc, bg); DeleteObject(bg);
-    fillRound(dc, rc, rc.bottom - rc.top, sel ? C_ACCENT : C_CARD);
+    int pr = rc.bottom - rc.top;
+    fillRound(dc, rc, pr, sel ? C_SELBG : C_CARD2); strokeRound(dc, rc, pr, C_LINE, 1.0f);
     std::wstring lbl; for (auto& r : g_rows) if (r.ctrl == d->hwndItem) { lbl = r.label; break; }
+    COLORREF fg = sel ? C_TEXT : C_TEXT2;
+    int mi = (int)d->CtlID - ID_SEL_BASE;                  // which registered button this pill is
+    int btn = (mi >= 0 && mi < (int)g_maps.size()) ? g_maps[mi].button : 0;
+    int gsz = P(16);                                       // "Mouse Icons" pack glyph on the pill
+    drawSvg(dc, rc.left + P(12), (rc.top + rc.bottom - gsz) / 2, gsz, fg, mouseGlyphFor(btn), 1.6, false);
     SetBkMode(dc, TRANSPARENT); SelectObject(dc, g_font);
-    SetTextColor(dc, sel ? RGB(255, 255, 255) : C_TEXT2);
-    DrawTextW(dc, lbl.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SetTextColor(dc, fg);
+    RECT tr = rc; tr.left += P(20);                        // center the label in the space beside the glyph
+    DrawTextW(dc, lbl.c_str(), -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 static const SvgIcon* linkIcon(int id) {
     return id == ID_WEBSITE ? &kGlobeIcon : id == ID_GITHUB ? &kGithubIcon : id == ID_EMAIL ? &kMailIcon : nullptr;
@@ -1820,9 +2178,9 @@ static void drawLinkBtn(const DRAWITEMSTRUCT* d) {   // About-page action button
     HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &rc, bg); DeleteObject(bg);
     std::wstring lbl; for (auto& r : g_rows) if (r.ctrl == d->hwndItem) { lbl = r.label; break; }
     SetBkMode(dc, TRANSPARENT);
-    if (d->CtlID == ID_DONATE) {                       // primary gradient pill
-        fillRoundGrad(dc, rc, P(12), C_ACCENT2, C_ACCENT);
-        SelectObject(dc, g_font); SetTextColor(dc, RGB(255, 255, 255));
+    if (d->CtlID == ID_DONATE) {                       // primary action pill (neutral, bordered)
+        fillRound(dc, rc, P(10), C_CARD2); strokeRound(dc, rc, P(10), C_LINE, 1.0f);
+        SelectObject(dc, g_font); SetTextColor(dc, C_TEXT);
         DrawTextW(dc, lbl.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         return;
     }
@@ -1863,11 +2221,12 @@ LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps); RECT cr; GetClientRect(h, &cr);
         HDC dc = CreateCompatibleDC(hdc); HBITMAP bmp = CreateCompatibleBitmap(hdc, cr.right, cr.bottom); HGDIOBJ ob = SelectObject(dc, bmp);
-        HBRUSH bg = CreateSolidBrush(RGB(0x20, 0x20, 0x26)); FillRect(dc, &cr, bg); DeleteObject(bg);
+        HBRUSH bg = CreateSolidBrush(RGB(0x1a, 0x1a, 0x1a)); FillRect(dc, &cr, bg); DeleteObject(bg);
+        strokeRound(dc, cr, P(12), C_LINE, 1.0f);
         SetBkMode(dc, TRANSPARENT);
         for (int i = 0; i < (int)g_popItems.size(); i++) {
             int y = P(g_popTop) + i * g_popItemH; RECT ir = { P(6), y, cr.right - P(6), y + g_popItemH };
-            if (i == g_popHover) fillRound(dc, ir, P(8), C_ACCENT);
+            if (i == g_popHover) fillRound(dc, ir, P(8), C_SELBG);
             SelectObject(dc, g_font); SetTextColor(dc, i == g_popHover ? RGB(255, 255, 255) : C_TEXT);
             RECT tr = { P(36), y, cr.right - P(10), y + g_popItemH };
             DrawTextW(dc, g_popItems[i].c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1912,19 +2271,29 @@ static void doDropdown(HWND hwnd, int id) {
     else {
         { std::lock_guard<std::mutex> lock(g_mutex); *d.val = idx; }
         if (id == ID_SIZE) ApplyCursorTheme(g_cfg.theme);
-        if ((idx == 7 || idx == 8) && id >= ID_DYN_BASE && id < ID_DYN_REMOVE) {
-            int mi = (id - ID_DYN_BASE) / 8, tr = (id - ID_DYN_BASE) % 8;
-            if (idx == 7) {                                          // Keyboard shortcut -> capture combo
-                int combo = CaptureKeyCombo();
-                std::lock_guard<std::mutex> lock(g_mutex);           // hook thread reads g_maps
-                if (combo) { if (tr == 0) g_maps[mi].keyC = combo; else if (tr == 1) g_maps[mi].keyD = combo; else g_maps[mi].keyH = combo; }
-                else *d.val = 0;
-            } else {                                                 // Type text -> prompt for a string
-                std::wstring cur = tr == 0 ? g_maps[mi].txtC : tr == 1 ? g_maps[mi].txtD : g_maps[mi].txtH;
-                std::wstring t = InputText(L"Type text", cur);
-                std::lock_guard<std::mutex> lock(g_mutex);           // hook thread reads g_maps
-                if (!t.empty()) { if (tr == 0) g_maps[mi].txtC = t; else if (tr == 1) g_maps[mi].txtD = t; else g_maps[mi].txtH = t; }
-                else *d.val = 0;
+        if (id >= ID_DYN_BASE && id < ID_DYN_REMOVE) {
+            int mi = (id - ID_DYN_BASE) / 16, tr = (id - ID_DYN_BASE) % 16;
+            if ((idx == 7 || idx == 8) && tr <= 2) {                 // only Click/Double/Hold capture a combo/text
+                if (idx == 7) {                                      // Keyboard shortcut -> capture combo
+                    int combo = CaptureKeyCombo();
+                    std::lock_guard<std::mutex> lock(g_mutex);       // hook thread reads g_maps
+                    if (combo) { if (tr == 0) g_maps[mi].keyC = combo; else if (tr == 1) g_maps[mi].keyD = combo; else g_maps[mi].keyH = combo; }
+                    else *d.val = 0;
+                } else {                                             // Type text -> prompt for a string
+                    std::wstring cur = tr == 0 ? g_maps[mi].txtC : tr == 1 ? g_maps[mi].txtD : g_maps[mi].txtH;
+                    std::wstring t = InputText(L"Type text", cur);
+                    std::lock_guard<std::mutex> lock(g_mutex);       // hook thread reads g_maps
+                    if (!t.empty()) { if (tr == 0) g_maps[mi].txtC = t; else if (tr == 1) g_maps[mi].txtD = t; else g_maps[mi].txtH = t; }
+                    else *d.val = 0;
+                }
+            }
+            if (tr == 4) {                                           // Click+Drag changed -> gesture rows appear/disappear
+                if (idx == 7) {                                      // switched to Gesture: seed sensible defaults
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    BtnMap& m = g_maps[mi];
+                    if (!m.gU && !m.gD && !m.gL && !m.gR) { m.gU = 5; m.gD = 6; m.gL = 1; m.gR = 2; }  // TaskView / ShowDesktop / Back / Forward
+                }
+                SaveConfig(); RebuildButtons(hwnd); return;
             }
         }
     }
@@ -1932,46 +2301,44 @@ static void doDropdown(HWND hwnd, int id) {
     InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
 }
 static void drawAbout(HDC dc, int cardL, int cardR) {
-    const int inL = cardL + P(26), inR = cardR - P(26);
     SetBkMode(dc, TRANSPARENT);
 
-    // ---- identity card ----
-    RECT card1 = { cardL, P(96), cardR, P(328) };
-    fillRound(dc, card1, P(16), C_CARD); strokeRound(dc, card1, P(16), C_LINE, 1.0f);
-
-    RECT bd = { inL, P(122), inL + P(56), P(122) + P(56) }; fillRoundGrad(dc, bd, P(15), C_ACCENT2, C_ACCENT);
-    drawSvg(dc, bd.left + P(13), bd.top + P(13), P(30), RGB(255, 255, 255), kMouseIcon, 1.8, true);
+    // ---- identity (flat — no card) ----
+    RECT bd = { cardL, P(92), cardL + P(54), P(92) + P(54) };
+    fillRound(dc, bd, P(13), C_CARD2); strokeRound(dc, bd, P(13), C_LINE, 1.0f);
+    drawSvg(dc, bd.left + P(13), bd.top + P(13), P(28), C_TEXT, kMouseIcon, 1.9, false);
     int tx = bd.right + P(18);
 
     SelectObject(dc, g_fontTitle); SetTextColor(dc, C_TEXT);
-    TextOutW(dc, tx, P(128), L"smooly", 6);
+    TextOutW(dc, tx, P(100), L"smooly", 6);
     SIZE nm; GetTextExtentPoint32W(dc, L"smooly", 6, &nm);
     SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
-    TextOutW(dc, tx + nm.cx + P(10), P(136), L"v" APP_VERSION, lstrlenW(L"v" APP_VERSION));
+    TextOutW(dc, tx + nm.cx + P(10), P(108), L"v" APP_VERSION, lstrlenW(L"v" APP_VERSION));
     SelectObject(dc, g_font); SetTextColor(dc, C_TEXT2);
     const wchar_t* tag = L"Make any mouse feel premium on Windows.";
-    TextOutW(dc, tx, P(154), tag, lstrlenW(tag));
+    TextOutW(dc, tx, P(126), tag, lstrlenW(tag));
 
+    // hairline divider spanning the content column
     HPEN line = CreatePen(PS_SOLID, 1, C_LINE); HGDIOBJ op = SelectObject(dc, line);
-    MoveToEx(dc, inL, P(200), nullptr); LineTo(dc, inR, P(200)); SelectObject(dc, op); DeleteObject(line);
+    MoveToEx(dc, cardL, P(172), nullptr); LineTo(dc, cardR, P(172)); SelectObject(dc, op); DeleteObject(line);
 
     // "Made with ♥ by Nischal Dahal" — the heart in red.
     SelectObject(dc, g_font);
     const wchar_t* a = L"Made with "; const wchar_t* b = L"♥"; const wchar_t* c = L" by Nischal Dahal";
     SIZE s1, s2; GetTextExtentPoint32W(dc, a, lstrlenW(a), &s1); GetTextExtentPoint32W(dc, b, 1, &s2);
-    int ly = P(220);
-    SetTextColor(dc, C_TEXT);                TextOutW(dc, inL, ly, a, lstrlenW(a));
-    SetTextColor(dc, RGB(0xff, 0x5a, 0x5f)); TextOutW(dc, inL + s1.cx, ly, b, 1);
-    SetTextColor(dc, C_TEXT);                TextOutW(dc, inL + s1.cx + s2.cx, ly, c, lstrlenW(c));
+    int ly = P(192);
+    SetTextColor(dc, C_TEXT);   TextOutW(dc, cardL, ly, a, lstrlenW(a));
+    SetTextColor(dc, C_DANGER); TextOutW(dc, cardL + s1.cx, ly, b, 1);
+    SetTextColor(dc, C_TEXT);   TextOutW(dc, cardL + s1.cx + s2.cx, ly, c, lstrlenW(c));
 
     SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
     std::wstring em = std::wstring(L"Contact  ") + CONTACT_EMAIL;
-    TextOutW(dc, inL, P(246), em.c_str(), (int)em.size());
-    // Donate button is a child control drawn over this card.
+    TextOutW(dc, cardL, P(218), em.c_str(), (int)em.size());
+    // Donate is a flat child button at y=P(250).
 
-    // ---- support & links (flat list, not a card) ----
+    // ---- support & links (flat list) ----
     SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
-    TextOutW(dc, cardL + P(6), P(346), L"Support & links", 15);
+    TextOutW(dc, cardL, P(322), L"Support & links", 15);
     // Website / GitHub / Email are flat child rows; each draws its own top hairline.
 }
 static void PaintWindow(HWND hwnd, HDC hdc) {
@@ -1985,8 +2352,8 @@ static void PaintWindow(HWND hwnd, HDC hdc) {
     RECT sb = { 0, 0, P(SB_W), cr.bottom }; FillRect(dc, &sb, g_brSide);
 
     // wordmark: app badge + "smooly", with a hairline divider under it
-    { RECT bd = { P(18), P(16), P(18) + P(30), P(16) + P(30) }; fillRoundGrad(dc, bd, P(9), C_ACCENT2, C_ACCENT);
-      drawSvg(dc, bd.left + P(6), bd.top + P(6), P(18), RGB(255, 255, 255), kMouseIcon, 1.7, true); }
+    { RECT bd = { P(18), P(16), P(18) + P(30), P(16) + P(30) }; fillRound(dc, bd, P(9), C_CARD2); strokeRound(dc, bd, P(9), C_LINE, 1.0f);
+      drawSvg(dc, bd.left + P(7), bd.top + P(7), P(16), C_TEXT, kMouseIcon, 1.9, false); }
     SelectObject(dc, g_fontTitle); SetTextColor(dc, C_TEXT);
     TextOutW(dc, P(56), P(20), L"smooly", 6);
     { HPEN ln = CreatePen(PS_SOLID, 1, C_LINE); HGDIOBJ o = SelectObject(dc, ln);
@@ -1995,11 +2362,10 @@ static void PaintWindow(HWND hwnd, HDC hdc) {
     for (int i = 0; i < kNumPages; i++) {
         RECT ir = sidebarItem(i);
         bool sel = (i == g_page);
-        if (sel)                    fillRound(dc, ir, P(10), C_SELBG);
-        else if (i == g_hoverItem)  fillRound(dc, ir, P(10), C_HOVER);
-        if (sel) { RECT bar = { ir.left + P(4), ir.top + P(10), ir.left + P(7), ir.bottom - P(10) }; fillRound(dc, bar, P(2), C_ACCENT); }
+        if (sel)                    fillRound(dc, ir, P(9), C_SELBG);
+        else if (i == g_hoverItem)  fillRound(dc, ir, P(9), C_HOVER);
         int iy = ir.top + (ir.bottom - ir.top - P(20)) / 2;
-        drawSvg(dc, ir.left + P(18), iy, P(20), sel ? C_ACCENT : C_TEXT2, kIcons[i], 1.7, true);
+        drawSvg(dc, ir.left + P(18), iy, P(20), sel ? C_TEXT : C_TEXT2, kIcons[i], 1.7, true);
         RECT tr = { ir.left + P(48), ir.top, ir.right, ir.bottom };
         SelectObject(dc, g_font); SetTextColor(dc, sel ? C_TEXT : C_TEXT2);
         DrawTextW(dc, kPageNames[i], -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -2007,7 +2373,7 @@ static void PaintWindow(HWND hwnd, HDC hdc) {
 
     // sidebar footer: version tag
     SelectObject(dc, g_fontSmall); SetTextColor(dc, C_TEXT2);
-    TextOutW(dc, P(20), P(WIN_H - 34), L"v" APP_VERSION, lstrlenW(L"v" APP_VERSION));
+    TextOutW(dc, P(20), cr.bottom - P(34), L"v" APP_VERSION, lstrlenW(L"v" APP_VERSION));
 
     SelectObject(dc, g_fontTitle); SetTextColor(dc, C_TEXT);
     TextOutW(dc, P(SB_W + 28), P(20), kPageNames[g_page], lstrlenW(kPageNames[g_page]));
@@ -2136,7 +2502,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int id = LOWORD(wParam), code = HIWORD(wParam);
         if (id == IDM_OPEN)   { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); return 0; }
         if (id == IDM_QUIT)   { DestroyWindow(hwnd); return 0; }
-        if (id == IDM_TOGGLE) { { std::lock_guard<std::mutex> lock(g_mutex); g_cfg.enabled = !g_cfg.enabled; } SaveConfig(); InvalidateRect(GetDlgItem(hwnd, ID_ENABLE), nullptr, TRUE); return 0; }
+        if (id == IDM_TOGGLE) { { std::lock_guard<std::mutex> lock(g_mutex); g_cfg.enabled = !g_cfg.enabled; } HWND tw = GetDlgItem(hwnd, ID_ENABLE); InvalidateRect(tw, nullptr, FALSE); UpdateWindow(tw); SaveConfig(); return 0; }
         if (code != BN_CLICKED) return 0;
         if (id == ID_DONATE)  { ShellExecuteW(hwnd, L"open", URL_DONATE,  nullptr, nullptr, SW_SHOWNORMAL); return 0; }
         if (id == ID_WEBSITE) { ShellExecuteW(hwnd, L"open", URL_WEBSITE, nullptr, nullptr, SW_SHOWNORMAL); return 0; }
@@ -2158,10 +2524,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (int* v = toggleCfg(id)) {
             { std::lock_guard<std::mutex> lock(g_mutex); *v = !*v; }
+            HWND tw = GetDlgItem(hwnd, id);
+            InvalidateRect(tw, nullptr, FALSE); UpdateWindow(tw);   // repaint the new state NOW, before any disk/registry I/O
             if (id == ID_NOACCEL) ApplyNoAccel(*v);
             if (id == ID_STARTUP) SetStartup(*v);
             SaveConfig();
-            InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
             return 0;
         }
         DdInfo dd; if (ddInfo(id, dd)) doDropdown(hwnd, id);
@@ -2170,7 +2537,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_APP + 2: {   // capture box registered a button
         int btn = (int)wParam;
-        if (btn == 3 || btn == 4 || btn == 5) {
+        if (btn >= 3 && btn <= 5) {   // middle / back / forward only — never the primary/secondary click
             bool ex = false; for (auto& m : g_maps) if (m.button == btn) { ex = true; break; }
             if (!ex) {
                 { std::lock_guard<std::mutex> lock(g_mutex); g_maps.push_back(BtnMap{ btn }); }     // hook thread reads g_maps
@@ -2187,6 +2554,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowTrayMenu(hwnd);
         }
         return 0;
+
+    case WM_HOTKEY:                // Ctrl+Alt+S — always opens settings (escape hatch if a remap breaks clicking)
+        ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd);
+        return 0;
+
+    case WM_INPUT:                 // a touchpad HID report arrived -> mark the touchpad recently active
+        g_touchpadUntil.store(nowTicks() + (LONGLONG)kTouchpadWindowMs * g_qpcFreq / 1000);
+        return DefWindowProcW(hwnd, msg, wParam, lParam);   // must clean up the raw-input buffer
 
     case WM_CLOSE:                 // keep running in the tray instead of quitting
         ShowWindow(hwnd, SW_HIDE);
@@ -2297,6 +2672,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                           nullptr, nullptr, hInst, nullptr);
     BOOL dark = TRUE;
     DwmSetWindowAttribute(g_wnd, 20, &dark, sizeof(dark));   // dark title bar (DWMWA_USE_IMMERSIVE_DARK_MODE)
+    RegisterHotKey(g_wnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S');   // always-available escape to open settings
+
+    // Raw Input on the precision-touchpad HID collection: any report = the touchpad is in use,
+    // so its (already-smooth) scroll is passed through instead of being double-smoothed.
+    RAWINPUTDEVICE rid = {};
+    rid.usUsagePage = 0x0D;   // Digitizers
+    rid.usUsage     = 0x05;   // Touch Pad
+    rid.dwFlags     = RIDEV_INPUTSINK;
+    rid.hwndTarget  = g_wnd;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
 
     g_nid.cbSize           = sizeof(g_nid);
     g_nid.hWnd             = g_wnd;
