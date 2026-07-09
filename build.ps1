@@ -16,8 +16,9 @@ else {
 if (-not $gpp) { Write-Host "No g++ found. See README.md > Build." -ForegroundColor Red; exit 1 }
 
 # gcc invokes 'as'/'ld'/'windres' by short name — its bin dir must be on PATH.
+# Prepend it to PATH to ensure we load the correct DLLs/executables of the toolchain first.
 $bin = Split-Path $gpp -Parent
-if ($env:Path -notlike "*$bin*") { $env:Path = "$bin;$env:Path" }
+$env:Path = "$bin;$env:Path"
 $windres = Join-Path $bin "windres.exe"
 
 Write-Host "Compiling resources (manifest)..." -ForegroundColor Cyan

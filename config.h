@@ -23,20 +23,22 @@ struct Config {
 
 // A dynamically-registered mouse button and the actions bound to its triggers.
 //   button: 3 = Middle, 4 = Back (X1), 5 = Forward (X2)
-// keyC/keyD/keyH hold a captured shortcut (packed: (mods<<8)|vk) used when the
-// matching Click/Double/Hold action is "Keyboard shortcut".
+// keyC/keyD/keyH/keyT hold a captured shortcut (packed: (mods<<8)|vk) used when the
+// matching Click/Double/Hold/Triple action is "Keyboard shortcut".
 struct BtnMap {
     int button = 0;
-    int click = 0, dbl = 0, hold = 0, scroll = 0, drag = 0;
-    int keyC = 0, keyD = 0, keyH = 0;                // captured combo when action = Keyboard shortcut
-    std::wstring txtC, txtD, txtH;                   // text to type when action = Type text
+    int click = 0, dbl = 0, hold = 0, scroll = 0, drag = 0, triple = 0;
+    int keyC = 0, keyD = 0, keyH = 0, keyT = 0;      // captured combo when action = Keyboard shortcut
+    std::wstring txtC, txtD, txtH, txtT;              // text to type when action = Type text
     int gU = 0, gD = 0, gL = 0, gR = 0;              // gesture direction actions (when drag = Gesture)
 };
 
-// Actions for Click / Double-Click / Hold.  7 captures a key combo, 8 types a string.
+// Actions for Click / Double-Click / Hold / Triple-Click.  7 captures a key combo, 8 types a string.
 //   0 Default (keep native) · 1 Middle · 2 Copy · 3 Paste · 4 Back · 5 Forward · 6 None (do nothing) · 7 Keyboard shortcut · 8 Type text
-static const wchar_t* const kButtonActions[9] = {
-    L"Default", L"Middle click", L"Copy", L"Paste", L"Back", L"Forward", L"None", L"Keyboard shortcut", L"Type text"
+//   9 Next track · 10 Previous track · 11 Play/Pause · 12 Volume up · 13 Volume down
+static const wchar_t* const kButtonActions[14] = {
+    L"Default", L"Middle click", L"Copy", L"Paste", L"Back", L"Forward", L"None", L"Keyboard shortcut", L"Type text",
+    L"Next track", L"Previous track", L"Play / Pause", L"Volume up", L"Volume down"
 };
 // Action while the button is held and the wheel is turned (Click and Scroll).
 //   0 None · 1 Horizontal scroll · 2 Zoom (Ctrl+wheel) · 3 Fast (swift) scroll
