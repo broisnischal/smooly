@@ -120,7 +120,8 @@ static std::atomic<bool>     g_grabWant{false};    // hook: a Grab (hand-pan) dr
 static std::atomic<bool>     g_grabApplied{false}; // anim: the hand cursor is currently installed
 static void ApplyGrabCursor();     // install a Figma-style grab hand as every cursor (anim thread)
 static void ReleaseGrabCursor();   // restore the theme cursors when the grab ends
-static int      g_lastClickBtn = 0; static LONGLONG g_lastClickAt = 0;   // double-click (hook only)
+static int      g_lastClickBtn = 0; static LONGLONG g_lastClickAt = 0;   // double/triple-click (hook only)
+static int      g_clickCount = 0;                                       // clicks seen in the current burst (hook only)
 static LONG     g_dragLastX = 0, g_dragLastY = 0; static int g_dragTotal = 0, g_dragAccX = 0;  // drag (hook only)
 static LONGLONG g_dragLastT = 0; static double g_dragVX = 0, g_dragVY = 0;  // drag velocity for inertia (hook only, units/ms)
 static LONG     g_gestDx = 0, g_gestDy = 0;         // gesture net displacement while a Gesture button is held (hook only)
@@ -295,7 +296,7 @@ static const wchar_t* const CONTACT_EMAIL = L"nischaldahal01395@gmail.com";
 #define ID_GITHUB  1032
 #define ID_EMAIL   1033
 #define ID_CAPTURE 1022
-#define ID_DYN_BASE 3000   // dynamic button dropdowns: 3000 + mapIndex*8 + trigger(0..3)
+#define ID_DYN_BASE 3000   // dynamic button dropdowns: 3000 + mapIndex*16 + trigger(0..9)
 #define ID_SEL_BASE 3700   // 3700 + mapIndex = Buttons-page selector pill
 #define ID_DYN_REMOVE 3900 // 3900 + mapIndex = "remove this button"
 #define ID_STARTUP 1007
@@ -355,13 +356,16 @@ static void LoadConfig() {
         wsprintfW(k, L"h%d", i);  m.hold   = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wsprintfW(k, L"s%d", i);  m.scroll = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wsprintfW(k, L"g%d", i);  m.drag   = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
+        wsprintfW(k, L"t%d", i);  m.triple = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wsprintfW(k, L"kc%d", i); m.keyC   = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wsprintfW(k, L"kd%d", i); m.keyD   = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wsprintfW(k, L"kh%d", i); m.keyH   = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
+        wsprintfW(k, L"kt%d", i); m.keyT   = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wchar_t tb[512];
         wsprintfW(k, L"tc%d", i); GetPrivateProfileStringW(L"buttons", k, L"", tb, 512, p.c_str()); m.txtC = tb;
         wsprintfW(k, L"td%d", i); GetPrivateProfileStringW(L"buttons", k, L"", tb, 512, p.c_str()); m.txtD = tb;
         wsprintfW(k, L"th%d", i); GetPrivateProfileStringW(L"buttons", k, L"", tb, 512, p.c_str()); m.txtH = tb;
+        wsprintfW(k, L"tt%d", i); GetPrivateProfileStringW(L"buttons", k, L"", tb, 512, p.c_str()); m.txtT = tb;
         wsprintfW(k, L"gu%d", i); m.gU = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wsprintfW(k, L"gd%d", i); m.gD = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
         wsprintfW(k, L"gl%d", i); m.gL = GetPrivateProfileIntW(L"buttons", k, 0, p.c_str());
@@ -402,12 +406,15 @@ static void SaveConfig() {
         wsprintfW(k, L"h%d", (int)i);  Wc(L"buttons", k, m.hold);
         wsprintfW(k, L"s%d", (int)i);  Wc(L"buttons", k, m.scroll);
         wsprintfW(k, L"g%d", (int)i);  Wc(L"buttons", k, m.drag);
+        wsprintfW(k, L"t%d", (int)i);  Wc(L"buttons", k, m.triple);
         wsprintfW(k, L"kc%d", (int)i); Wc(L"buttons", k, m.keyC);
         wsprintfW(k, L"kd%d", (int)i); Wc(L"buttons", k, m.keyD);
         wsprintfW(k, L"kh%d", (int)i); Wc(L"buttons", k, m.keyH);
+        wsprintfW(k, L"kt%d", (int)i); Wc(L"buttons", k, m.keyT);
         wsprintfW(k, L"tc%d", (int)i); WritePrivateProfileStringW(L"buttons", k, m.txtC.c_str(), p.c_str());
         wsprintfW(k, L"td%d", (int)i); WritePrivateProfileStringW(L"buttons", k, m.txtD.c_str(), p.c_str());
         wsprintfW(k, L"th%d", (int)i); WritePrivateProfileStringW(L"buttons", k, m.txtH.c_str(), p.c_str());
+        wsprintfW(k, L"tt%d", (int)i); WritePrivateProfileStringW(L"buttons", k, m.txtT.c_str(), p.c_str());
         wsprintfW(k, L"gu%d", (int)i); Wc(L"buttons", k, m.gU);
         wsprintfW(k, L"gd%d", (int)i); Wc(L"buttons", k, m.gD);
         wsprintfW(k, L"gl%d", (int)i); Wc(L"buttons", k, m.gL);
@@ -1034,26 +1041,45 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
           } }
         if (g_grabWant.exchange(false)) wakeAnim();   // end a grab -> anim restores the theme cursors
         if (g_pScrolled.load() || g_pHoldFired.load() || g_pDragged.load()) return 1;  // consumed
-        int clickAct, clickCombo, dblAct, dblCombo; std::wstring clickText, dblText;
+        int clickAct, clickCombo, dblAct, dblCombo, tripleAct, tripleCombo;
+        std::wstring clickText, dblText, tripleText;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             BtnMap* m = findMap(btn);
             clickAct = (m && m->click != 0) ? m->click : nativeClick(btn);
             clickCombo = m ? m->keyC : 0; clickText = m ? m->txtC : L"";
             dblAct = m ? m->dbl : 0; dblCombo = m ? m->keyD : 0; dblText = m ? m->txtD : L"";
+            tripleAct = m ? m->triple : 0; tripleCombo = m ? m->keyT : 0; tripleText = m ? m->txtT : L"";
         }
         LONGLONG now = nowTicks();
-        if (dblAct != 0 && btn == g_lastClickBtn && ticksToMs(now - g_lastClickAt) <= kDblMs) {
-            g_lastClickBtn = 0; g_pendAction.store(0);             // second click -> double
-            fireAct(dblAct, dblCombo, dblText);
+        if (dblAct == 0 && tripleAct == 0) {                       // no multi-click configured: every click fires now
+            g_lastClickBtn = 0; g_clickCount = 0;
+            fireAct(clickAct, clickCombo, clickText);
         } else {
-            g_lastClickBtn = btn; g_lastClickAt = now;
-            if (dblAct != 0) {
+            bool chained = (btn == g_lastClickBtn) && ticksToMs(now - g_lastClickAt) <= kDblMs;
+            int n = chained ? g_clickCount + 1 : 1;
+            g_lastClickBtn = btn; g_lastClickAt = now; g_clickCount = n;
+            if (n == 1) {                                          // 1st click: wait to see if a 2nd comes
                 g_pendAction.store(clickAct); g_pendCombo.store(clickCombo);
                 { std::lock_guard<std::mutex> lock(g_mutex); g_pendText = clickText; }
                 g_pendDeadline.store(now + (LONGLONG)kDblMs * g_qpcFreq / 1000);
                 wakeAnim();                    // the anim thread fires it after kDblMs
-            } else fireAct(clickAct, clickCombo, clickText);
+            } else if (n == 2) {                                    // 2nd click: double, or wait for a 3rd
+                g_pendAction.store(0);
+                if (tripleAct != 0) {
+                    g_pendAction.store(dblAct); g_pendCombo.store(dblCombo);
+                    { std::lock_guard<std::mutex> lock(g_mutex); g_pendText = dblText; }
+                    g_pendDeadline.store(now + (LONGLONG)kDblMs * g_qpcFreq / 1000);
+                    wakeAnim();
+                } else {
+                    g_clickCount = 0;
+                    fireAct(dblAct, dblCombo, dblText);
+                }
+            } else {                                                // 3rd click: triple, burst ends
+                g_clickCount = 0;
+                g_pendAction.store(0);
+                if (tripleAct != 0) fireAct(tripleAct, tripleCombo, tripleText);
+            }
         }
         return 1;
     }
@@ -1206,12 +1232,18 @@ static void MouseBtnUp(int a) {
     else if (a == 4) MouseX(MOUSEEVENTF_XUP, XBUTTON1);
     else if (a == 5) MouseX(MOUSEEVENTF_XUP, XBUTTON2);
 }
-static void PerformButtonAction(int a) {   // see kButtonActions (1..6; 0/7 handled elsewhere)
+static void TapKey(WORD vk) { SendKey(vk, false); SendKey(vk, true); }   // media / volume keys
+static void PerformButtonAction(int a) {   // see kButtonActions (1..6, 9..13; 0/7/8 handled elsewhere)
     switch (a) {
     case 1: MouseClick(MOUSEEVENTF_MIDDLEDOWN); MouseClick(MOUSEEVENTF_MIDDLEUP); break;
     case 2: SendKey(VK_CONTROL, false); SendKey('C', false); SendKey('C', true); SendKey(VK_CONTROL, true); break;
     case 3: SendKey(VK_CONTROL, false); SendKey('V', false); SendKey('V', true); SendKey(VK_CONTROL, true); break;
     case 4: MouseX(MOUSEEVENTF_XDOWN, XBUTTON1); MouseX(MOUSEEVENTF_XUP, XBUTTON1); break;
+    case 9:  TapKey(VK_MEDIA_NEXT_TRACK); break;
+    case 10: TapKey(VK_MEDIA_PREV_TRACK); break;
+    case 11: TapKey(VK_MEDIA_PLAY_PAUSE); break;
+    case 12: TapKey(VK_VOLUME_UP);   break;
+    case 13: TapKey(VK_VOLUME_DOWN); break;
     case 5: MouseX(MOUSEEVENTF_XDOWN, XBUTTON2); MouseX(MOUSEEVENTF_XUP, XBUTTON2); break;
     case 20: MouseClick(MOUSEEVENTF_LEFTDOWN);  MouseClick(MOUSEEVENTF_LEFTUP);  break;  // native left  (Default on a remapped left)
     case 21: MouseClick(MOUSEEVENTF_RIGHTDOWN); MouseClick(MOUSEEVENTF_RIGHTUP); break;  // native right (Default on a remapped right)
@@ -1230,7 +1262,6 @@ static void PerformKeyCombo(int c) {       // packed (mods<<8)|vk
     if (mods & 2) SendKey(VK_SHIFT, true);
     if (mods & 1) SendKey(VK_CONTROL, true);
 }
-static void TapKey(WORD vk) { SendKey(vk, false); SendKey(vk, true); }   // media / volume keys
 // Run a gesture-direction action (on the animation thread). See kGestureActions.
 static void PerformGestureAction(int a) {
     switch (a) {
@@ -1552,15 +1583,16 @@ static bool ddInfo(int id, DdInfo& d) {
         if (mi < 0 || mi >= (int)g_maps.size()) return false;
         BtnMap& m = g_maps[mi];
         switch (tr) {
-        case 0: d.val = &m.click;  d.opts = kButtonActions; d.n = 9; return true;
-        case 1: d.val = &m.dbl;    d.opts = kButtonActions; d.n = 9; return true;
-        case 2: d.val = &m.hold;   d.opts = kButtonActions; d.n = 9; return true;
+        case 0: d.val = &m.click;  d.opts = kButtonActions; d.n = 14; return true;
+        case 1: d.val = &m.dbl;    d.opts = kButtonActions; d.n = 14; return true;
+        case 2: d.val = &m.hold;   d.opts = kButtonActions; d.n = 14; return true;
         case 3: d.val = &m.scroll; d.opts = kScrollActions; d.n = 4; return true;
         case 4: d.val = &m.drag;   d.opts = kDragActions;   d.n = 8; return true;
         case 5: d.val = &m.gU;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
         case 6: d.val = &m.gD;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
         case 7: d.val = &m.gL;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
         case 8: d.val = &m.gR;     d.opts = kGestureActions; d.n = kNumGestureActions; return true;
+        case 9: d.val = &m.triple; d.opts = kButtonActions; d.n = 14; return true;
         }
         return false;
     }
@@ -1603,12 +1635,12 @@ static std::wstring ddText(int id) {
     if (d.theme) return g_cfg.theme.empty() ? L"Windows Default" : g_cfg.theme;
     int v = *d.val; if (v < 0 || v >= d.n) v = 0;
     if ((v == 7 || v == 8) && id >= ID_DYN_BASE && id < ID_DYN_REMOVE
-        && ((id - ID_DYN_BASE) % 16) <= 2) {           // only Click/Double/Hold carry combos/text
+        && (((id - ID_DYN_BASE) % 16) <= 2 || ((id - ID_DYN_BASE) % 16) == 9)) {   // Click/Double/Hold/Triple carry combos/text
         int mi = (id - ID_DYN_BASE) / 16, tr = (id - ID_DYN_BASE) % 16;
         if (mi >= 0 && mi < (int)g_maps.size()) {
             const BtnMap& m = g_maps[mi];
-            if (v == 7) return comboText(tr == 0 ? m.keyC : tr == 1 ? m.keyD : m.keyH);   // captured combo
-            std::wstring t = (tr == 0 ? m.txtC : tr == 1 ? m.txtD : m.txtH);              // typed text
+            if (v == 7) return comboText(tr == 0 ? m.keyC : tr == 1 ? m.keyD : tr == 2 ? m.keyH : m.keyT);   // captured combo
+            std::wstring t = (tr == 0 ? m.txtC : tr == 1 ? m.txtD : tr == 2 ? m.txtH : m.txtT);              // typed text
             if (t.empty()) return L"Type text";
             if (t.size() > 16) t = t.substr(0, 15) + L"…";
             return L"“" + t + L"”";
@@ -1876,15 +1908,17 @@ static void BuildButtonsPage(HWND hwnd) {
     }
     y += ph + P(22);
 
-    static const wchar_t* trg[5] = { L"Click", L"Double-Click", L"Hold", L"Click + Scroll", L"Click + Drag" };
-    static const wchar_t* trgD[5] = {
+    static const int trCode[6] = { 0, 1, 9, 2, 3, 4 };    // display order -> underlying trigger slot
+    static const wchar_t* trg[6] = { L"Click", L"Double-Click", L"Triple-Click", L"Hold", L"Click + Scroll", L"Click + Drag" };
+    static const wchar_t* trgD[6] = {
         L"Action when you press this button",
         L"Action for two quick presses",
+        L"Action for three quick presses",
         L"Action when you press and hold",
         L"Hold the button, then spin the wheel",
         L"Hold the button, then move the mouse" };
     int mi = g_selBtn;                                   // only the selected button's card
-    for (int tr = 0; tr < 5; tr++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 16 + tr, trg[tr], y, trgD[tr]); y += P(ROW_H); }
+    for (int i = 0; i < 6; i++) { addRow(hwnd, 2, mi, 1, ID_DYN_BASE + mi * 16 + trCode[i], trg[i], y, trgD[i]); y += P(ROW_H); }
     if (g_maps[mi].drag == 7) {                          // Gesture: 4 direction actions
         static const wchar_t* gname[4] = { L"Gesture ↑ Up", L"Gesture ↓ Down", L"Gesture ← Left", L"Gesture → Right" };
         static const wchar_t* gdesc[4] = { L"Flick up while holding the button", L"Flick down while holding the button",
@@ -2273,17 +2307,17 @@ static void doDropdown(HWND hwnd, int id) {
         if (id == ID_SIZE) ApplyCursorTheme(g_cfg.theme);
         if (id >= ID_DYN_BASE && id < ID_DYN_REMOVE) {
             int mi = (id - ID_DYN_BASE) / 16, tr = (id - ID_DYN_BASE) % 16;
-            if ((idx == 7 || idx == 8) && tr <= 2) {                 // only Click/Double/Hold capture a combo/text
+            if ((idx == 7 || idx == 8) && (tr <= 2 || tr == 9)) {     // only Click/Double/Hold/Triple capture a combo/text
                 if (idx == 7) {                                      // Keyboard shortcut -> capture combo
                     int combo = CaptureKeyCombo();
                     std::lock_guard<std::mutex> lock(g_mutex);       // hook thread reads g_maps
-                    if (combo) { if (tr == 0) g_maps[mi].keyC = combo; else if (tr == 1) g_maps[mi].keyD = combo; else g_maps[mi].keyH = combo; }
+                    if (combo) { if (tr == 0) g_maps[mi].keyC = combo; else if (tr == 1) g_maps[mi].keyD = combo; else if (tr == 2) g_maps[mi].keyH = combo; else g_maps[mi].keyT = combo; }
                     else *d.val = 0;
                 } else {                                             // Type text -> prompt for a string
-                    std::wstring cur = tr == 0 ? g_maps[mi].txtC : tr == 1 ? g_maps[mi].txtD : g_maps[mi].txtH;
+                    std::wstring cur = tr == 0 ? g_maps[mi].txtC : tr == 1 ? g_maps[mi].txtD : tr == 2 ? g_maps[mi].txtH : g_maps[mi].txtT;
                     std::wstring t = InputText(L"Type text", cur);
                     std::lock_guard<std::mutex> lock(g_mutex);       // hook thread reads g_maps
-                    if (!t.empty()) { if (tr == 0) g_maps[mi].txtC = t; else if (tr == 1) g_maps[mi].txtD = t; else g_maps[mi].txtH = t; }
+                    if (!t.empty()) { if (tr == 0) g_maps[mi].txtC = t; else if (tr == 1) g_maps[mi].txtD = t; else if (tr == 2) g_maps[mi].txtH = t; else g_maps[mi].txtT = t; }
                     else *d.val = 0;
                 }
             }
